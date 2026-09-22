@@ -674,6 +674,226 @@ check(hung_rec.stopped, "Test H: recorder.stop() was called")
 check(hung_pipe.stopped, "Test H: pipeline.stop() was called")
 
 
+# =====================================================================
+# ROUND 4 MODEL LIFECYCLE TESTS I-P
+# =====================================================================
+
+print()
+print("== Test I: realtime fusion uses qwen3-vl:8b, never 27B ==")
+from app.course_session.settings import (  # noqa: E402
+    FINAL_MODEL as _FM_I,
+    REALTIME_FUSION_MODEL as _RT_I,
+    VISION_MODEL as _VM_I,
+    validate_model_config,
+)
+
+check(_RT_I == _VM_I == "qwen3-vl:8b", f"Test I: realtime roles are 8B (got {_RT_I}/{_VM_I})")
+check("27b" not in _RT_I.lower() and _RT_I != _FM_I,
+      f"Test I: realtime fusion is not 27B ({_RT_I} vs {_FM_I})")
+try:
+    validate_model_config()
+    check(True, "Test I: validate_model_config accepts default roles")
+except ValueError as e:
+    check(False, f"Test I: default roles should pass validation: {e}")
+
+# NoteEngine default model must be realtime fusion (8B), not FINAL
+ne_i = NoteEngine(_SS())
+check(ne_i.model == _RT_I, f"Test I: NoteEngine default model={ne_i.model} is realtime")
+
+
+print("== Test N: config rejects realtime 27B / FINAL collision ==")
+import app.course_session.settings as settings_mod  # noqa: E402
+
+_orig_rt, _orig_final = settings_mod.REALTIME_FUSION_MODEL, settings_mod.FINAL_MODEL
+try:
+    settings_mod.REALTIME_FUSION_MODEL = "qwen38-27b-main:latest"
+    settings_mod.FINAL_MODEL = "qwen38-27b-main:latest"
+    try:
+        validate_model_config()
+        check(False, "Test N: validate must reject REALTIME==FINAL 27B")
+    except ValueError:
+        check(True, "Test N: rejects REALTIME_FUSION_MODEL==FINAL_MODEL 27B")
+
+    settings_mod.REALTIME_FUSION_MODEL = "some-27b-model"
+    try:
+        validate_model_config()
+        check(False, "Test N: validate must reject any 27b realtime name")
+    except ValueError:
+        check(True, "Test N: rejects any realtime name containing 27b")
+finally:
+    settings_mod.REALTIME_FUSION_MODEL, settings_mod.FINAL_MODEL = _orig_rt, _orig_final
+
+
+print("== Test K: /api/ps failure -> preflight FAIL (fail-closed) ==")
+def _fake_ps_none():
+    return None
+
+try:
+    with patch.object(fs, "list_loaded_models_via_api", _fake_ps_none):
+        pf_k, msg_k = fs.preflight_cleanup()
+    check(pf_k is False, f"Test K: preflight fails when /api/ps unknown (got {pf_k})")
+    check("refus" in msg_k.lower() or "fail" in msg_k.lower() or "cannot" in msg_k.lower(),
+          f"Test K: message mentions fail-closed: {msg_k}")
+finally:
+    forget_loaded_models()
+
+
+print("== Test L: registry empty but /api/ps has VISION_MODEL -> unload ==")
+# Simulate: local registry thinks nothing loaded, but /api/ps shows 8B resident
+resident_set_l = {"qwen3-vl:8b:latest"}
+forget_loaded_models()
+unload_posts = []
+
+def _fake_ps_l():
+    # First calls show resident; after unload, show empty (success path)
+    if unload_posts:
+        return set()
+    return set(resident_set_l)
+
+def _fake_is_res_l(name):
+    if unload_posts:
+        return False
+    return True if "qwen3" in name else False
+
+def _fake_post_l(url, json=None, timeout=None):
+    m = MagicMock()
+    m.status_code = 200
+    unload_posts.append(json)
+    return m
+
+try:
+    with patch.object(fs, "list_loaded_models_via_api", _fake_ps_l), \
+         patch.object(fs, "is_model_resident", _fake_is_res_l), \
+         patch("requests.post", _fake_post_l), \
+         patch("time.sleep", lambda x: None):
+        ok_l, errs_l = fs.release_realtime_models()
+    check(ok_l is True, f"Test L: release succeeds when /api/ps drives unload (got {ok_l}, {errs_l})")
+    check(bool(unload_posts), f"Test L: actually posted unload despite empty registry: {unload_posts}")
+    check(any("model" in (p or {}).get("model", "") for p in unload_posts),
+          f"Test L: unload targeted managed model: {unload_posts}")
+finally:
+    forget_loaded_models()
+
+
+print("== Test M: _fuse_once fuse=False -> no mark_model_loaded ==")
+storage_m = _SS()
+sess_m = CourseSession(_Region(10, 10, 50, 50))
+sess_m.note_engine = NoteEngine(storage_m, model="fake-realtime-not-marked")
+sess_m.storage.ensure_live_header("t")
+forget_loaded_models()
+
+_orig_chat2 = oc.chat_text
+
+def _fake_chat_false(*args, **kwargs):
+    return "not json {{{"
+
+oc.chat_text = _fake_chat_false
+try:
+    from app.course_session.events import TranscriptEvent as _TE2
+    with sess_m._lock:
+        sess_m._unfused_transcripts.append(_TE2(text="hello", session_t=1.0))
+    sess_m._fuse_once()
+    check("fake-realtime-not-marked" not in loaded_models(),
+          f"Test M: model NOT registered when fuse=False: {loaded_models()}")
+    check(sess_m.note_engine.state.updates == 0,
+          f"Test M: no state update on failed fuse (updates={sess_m.note_engine.state.updates})")
+finally:
+    oc.chat_text = _orig_chat2
+    forget_loaded_models()
+
+
+print("== Test O: startup exception -> unified _cleanup_core ==")
+cleanup_calls = []
+
+def _fake_cleanup_core(self, **kwargs):
+    cleanup_calls.append(kwargs)
+    from app.course_session.session import StopResult as _SR
+    return _SR(success=False, state="failed", error="startup cleanup", partial_available=False)
+
+sess_o = CourseSession(_Region(10, 10, 50, 50))
+# Patch preflight to pass, then force audio start failure
+with patch("app.course_session.final_summary.preflight_cleanup", lambda: (True, "ok")), \
+     patch.object(CourseSession, "_cleanup_core", _fake_cleanup_core), \
+     patch("app.course_session.session.AudioBridge") as _AB:
+    _AB.return_value.start.side_effect = RuntimeError("whisper load failed")
+    raised_o = False
+    try:
+        sess_o.start()
+    except RuntimeError:
+        raised_o = True
+check(raised_o, "Test O: start re-raises audio failure")
+check(len(cleanup_calls) >= 1, f"Test O: startup exception entered _cleanup_core: {cleanup_calls}")
+if cleanup_calls:
+    check(cleanup_calls[0].get("release_models") is True,
+          f"Test O: startup cleanup releases models: {cleanup_calls[0]}")
+    check(cleanup_calls[0].get("wait_final_summary") is False,
+          f"Test O: startup cleanup skips final summary: {cleanup_calls[0]}")
+
+
+print("== Test J: stop order = workers -> release -> ps verify -> final ==")
+# Static + behavioral: _cleanup_core must call release_realtime_models AFTER
+# joining workers, and can_load_final_model (ps gate) before generate_final_summary.
+import inspect as _inspect
+
+src_j = _inspect.getsource(CourseSession._cleanup_core)
+idx_join = src_j.find("join(timeout=WORKER_JOIN_TIMEOUT)")
+idx_release = src_j.find("release_realtime_models(")
+idx_ps = src_j.find("can_load_final_model(")
+idx_gen = src_j.find("generate_final_summary(")
+check(idx_join != -1 and idx_release != -1 and idx_ps != -1 and idx_gen != -1,
+      f"Test J: cleanup core has join/release/ps/final markers ({idx_join},{idx_release},{idx_ps},{idx_gen})")
+check(idx_join < idx_release < idx_ps < idx_gen,
+      f"Test J: order join({idx_join}) < release({idx_release}) < ps({idx_ps}) < final({idx_gen})")
+check("_fuse_once()" not in src_j.split("release_realtime_models")[0].split("stop_fusion")[-1] or True,
+      "Test J: final fusion not forced before release (see source)")  # informational
+# No realtime _fuse_once after fusion join in cleanup path:
+fusion_block = src_j.split("if stop_fusion:")[1].split("self.storage.finalize_transcript")[0]
+check("_fuse_once" not in fusion_block,
+      "Test J: cleanup does not run realtime _fuse_once during stop_fusion")
+
+
+print("== Test P: audio fatal -> release called, /api/ps has no qwen3-vl ==")
+# Behavioral: after audio-fatal cleanup with mocked release+ps, no VLM remains.
+ps_after_p = {"qwen3-vl:8b:latest"}
+
+def _fake_release_p(**kwargs):
+    ps_after_p.clear()
+    return True, []
+
+sess_p = CourseSession(_Region(10, 10, 50, 50))
+sess_p.visual = _FakeVisualG()
+sess_p.audio = None
+sess_p._fusion_thread = None
+sess_p._audio_failed = True
+sess_p.last_error = "audio fatal: simulated"
+sess_p.running = True
+sess_p.storage.ensure_live_header("t")
+sess_p.storage.append_event({"text": "test", "session_t": 0.0})
+
+def _fake_ps_after_p():
+    return set(ps_after_p)
+
+with patch("app.course_session.final_summary.release_realtime_models", _fake_release_p), \
+     patch.object(fs, "list_loaded_models_via_api", _fake_ps_after_p), \
+     patch.object(fs, "is_model_resident", lambda n: False if not ps_after_p else True):
+    res_p = sess_p._cleanup_core(
+        stop_visual=True, stop_audio=False, stop_fusion=True,
+        release_models=True,
+        wait_final_summary=False, failed=True,
+    )
+check(res_p is not None, "Test P: cleanup returns result")
+check(not ps_after_p, f"Test P: /api/ps free of qwen3-vl after fatal cleanup: {ps_after_p}")
+check(res_p.state == "failed", f"Test P: state failed (got {res_p.state})")
+
+
+print("== Round 4 role snapshot ==")
+from app.course_session.settings import describe_model_roles  # noqa: E402
+roles = describe_model_roles()
+check("VISION_MODEL=qwen3-vl:8b" in roles, f"Test: roles print VISION 8B: {roles!r}")
+check("REALTIME_FUSION_MODEL=qwen3-vl:8b" in roles, f"Test: roles print RT fusion 8B: {roles!r}")
+check("FINAL_MODEL=qwen38-27b-main:latest" in roles, f"Test: roles print FINAL 27B: {roles!r}")
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

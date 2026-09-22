@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QPushButton, QLabel, QPlainTextEdit, QStatusBar,
 )
 
-from .settings import VISION_MODEL, FINAL_MODEL, SESSIONS_DIR  # noqa: E402
+from .settings import VISION_MODEL, REALTIME_FUSION_MODEL, FINAL_MODEL, SESSIONS_DIR  # noqa: E402
 from .session import CourseSession, StopResult  # noqa: E402
 
 # Reuse QLens region selector (unmodified upstream).
@@ -127,8 +127,8 @@ class CourseWindow(QMainWindow):
         root.addLayout(top)
 
         self.info = QLabel(
-            f"VLM: {VISION_MODEL} | 课后总结: {FINAL_MODEL} | "
-            f"会话目录: {SESSIONS_DIR}\n"
+            f"VLM: {VISION_MODEL} | 实时融合: {REALTIME_FUSION_MODEL} | "
+            f"课后总结: {FINAL_MODEL} | 会话目录: {SESSIONS_DIR}\n"
             "结束方式：点「结束课程」，或运行 stop_course.ps1 写入 STOP_REQUEST。"
         )
         self.info.setWordWrap(True)

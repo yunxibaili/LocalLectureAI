@@ -66,7 +66,7 @@ Test C（`/api/ps` 仍显示 VLM → release False + 拒绝）。
 
 **Fix**：
 - `preflight_cleanup()` 只查询本应用声明管理的模型（`FINAL_MODEL`/`VISION_MODEL`/
-  `FUSION_MODEL`），不碰其他进程的 Ollama 模型（约束 3）。
+  `REALTIME_FUSION_MODEL`），不碰其他进程的 Ollama 模型（约束 3）。
 - 发现管理模型 resident → unload + `/api/ps` verify + retry；仍 resident → 返回
   `(False, "Previous final model is still resident.")`。
 - `CourseSession.start()` 在 audio/visual/fusion start **之前**调用；失败则 `raise`
@@ -166,7 +166,7 @@ cleanup result (StopResult)
 2. **模型仍在 /api/ps → 不能进入 final summary**
    - `release_realtime_models()` 返回 `(True, ...)`
    - `can_load_final_model()` 返回 `(True, ...)`
-   - `/api/ps` 中无 VISION_MODEL / FUSION_MODEL / registry 中非 FINAL 模型
+   - `/api/ps` 中无 VISION_MODEL / REALTIME_FUSION_MODEL / registry 中非 FINAL 模型
 
 3. **cleanup 失败 → 不能加载 qwen38-27b-main**
    - `_cleanup_core` 中 `cleanup_status == CLEANUP_OK`

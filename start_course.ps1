@@ -11,14 +11,21 @@ try {
     Start-Sleep -Seconds 4
 }
 
-# 2) Model configuration (RTX 5070 12GB: VLM during class; 27B only after class)
-$env:VISION_MODEL        = if ($env:VISION_MODEL) { $env:VISION_MODEL } else { "qwen3-vl:8b" }
+# 2) Model configuration (RTX 5070 12GB: VLM during class; 27B only after class).
+#    Only set env defaults here — do NOT invent FUSION_MODEL overrides.
+#    Python settings.py owns REALTIME_FUSION_MODEL / FINAL_MODEL roles.
+$env:VISION_MODEL         = if ($env:VISION_MODEL) { $env:VISION_MODEL } else { "qwen3-vl:8b" }
 $env:FALLBACK_VISION_MODEL = if ($env:FALLBACK_VISION_MODEL) { $env:FALLBACK_VISION_MODEL } else { "qwen3-vl:4b" }
-$env:FUSION_MODEL        = $env:VISION_MODEL
-$env:FINAL_MODEL         = if ($env:FINAL_MODEL) { $env:FINAL_MODEL } else { "qwen38-27b-main:latest" }
-$env:WHISPER_MODEL       = if ($env:WHISPER_MODEL) { $env:WHISPER_MODEL } else { "turbo" }
-$env:WHISPER_LANGUAGE    = "zh"
-$env:WHISPER_DEVICE     = if ($env:WHISPER_DEVICE) { $env:WHISPER_DEVICE } else { "auto" }
+$env:REALTIME_FUSION_MODEL = if ($env:REALTIME_FUSION_MODEL) { $env:REALTIME_FUSION_MODEL } else { $env:VISION_MODEL }
+$env:FINAL_MODEL          = if ($env:FINAL_MODEL) { $env:FINAL_MODEL } else { "qwen38-27b-main:latest" }
+$env:WHISPER_MODEL        = if ($env:WHISPER_MODEL) { $env:WHISPER_MODEL } else { "turbo" }
+$env:WHISPER_LANGUAGE     = "zh"
+$env:WHISPER_DEVICE      = if ($env:WHISPER_DEVICE) { $env:WHISPER_DEVICE } else { "auto" }
+
+# Print effective roles (must match docs/MODEL_LIFECYCLE_ARCHITECTURE.md)
+Write-Host "[start] VISION_MODEL=$env:VISION_MODEL"
+Write-Host "[start] REALTIME_FUSION_MODEL=$env:REALTIME_FUSION_MODEL"
+Write-Host "[start] FINAL_MODEL=$env:FINAL_MODEL"
 
 # 3) Launch course app (venv python)
 $py = Join-Path $root ".venv\Scripts\python.exe"

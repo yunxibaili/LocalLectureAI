@@ -1,8 +1,8 @@
 """CourseSession: thin orchestrator gluing audio bridge, visual stream,
 note fusion loop and storage. No new capture/inference machinery.
 
-Round 3: unified cleanup core path — stop/fatal/exception all funnel through
-the same stop_workers + release_models + verify_ps sequence.
+Round 3/4: unified cleanup core path — stop/fatal/startup-exception all
+funnel through the same stop_workers + release_models + verify_ps sequence.
 """
 
 from __future__ import annotations
@@ -93,10 +93,21 @@ class CourseSession:
     def start(self) -> None:
         """Start audio + visual + fusion. Blocks until whisper is loaded.
 
-        Round 3: preflight_cleanup() runs BEFORE any workers start to unload
-        leftover FINAL_MODEL from a previous session.
+        Round 4:
+        - validate_model_config() rejects dangerous realtime/27B role configs.
+        - preflight_cleanup() fail-closed on /api/ps unknown before workers.
+        - Any startup exception funnels through unified _cleanup_core.
         """
-        # Preflight: unload leftover FINAL_MODEL before starting realtime
+        from .settings import describe_model_roles, validate_model_config
+
+        try:
+            validate_model_config()
+        except ValueError as e:
+            self.last_error = f"model config rejected: {e}"
+            self.state = SessionState.FAILED
+            raise RuntimeError(f"Cannot start session: {e}") from e
+        self._status("模型角色:\n" + describe_model_roles())
+
         from .final_summary import preflight_cleanup
 
         pf_ok, pf_msg = preflight_cleanup()
@@ -105,7 +116,7 @@ class CourseSession:
             self.state = SessionState.FAILED
             raise RuntimeError(
                 f"Cannot start session: {pf_msg}. "
-                "Previous final model must be unloaded before starting realtime phase."
+                "Previous models must be verified/unloaded before realtime phase."
             )
 
         self.running = True
@@ -127,16 +138,10 @@ class CourseSession:
             self.audio.start()
             self.storage.set_transcript_writer_path(self.audio.writer_path)
         except Exception as e:
-            # reverse partial start of visual not yet begun; audio rolls back itself
             self.last_error = f"audio start failed: {e}"
             self.running = False
             self.state = SessionState.FAILED
-            self.storage.clear_active_marker()
-            try:
-                if self.audio:
-                    self.audio.stop()
-            except Exception:
-                pass
+            self._startup_cleanup(stop_audio=True, stop_visual=False, stop_fusion=False)
             raise
 
         # Visual (QLens capture + VLM). Non-blocking thread.
@@ -152,27 +157,51 @@ class CourseSession:
             self.last_error = f"visual start failed: {e}"
             self.running = False
             self.state = SessionState.FAILED
-            try:
-                if self.audio:
-                    self.audio.stop()
-            except Exception:
-                pass
-            self.storage.clear_active_marker()
+            self._startup_cleanup(stop_audio=True, stop_visual=True, stop_fusion=False)
             raise
 
-        self._stop_fusion.clear()
-        self._fusion_thread = threading.Thread(
-            target=self._fusion_loop, name="FusionLoop", daemon=True
-        )
-        self._fusion_thread.start()
-        self._flag_thread = threading.Thread(
-            target=self._flag_loop, name="StopFlagWatch", daemon=True
-        )
-        self._flag_thread.start()
+        try:
+            self._stop_fusion.clear()
+            self._fusion_thread = threading.Thread(
+                target=self._fusion_loop, name="FusionLoop", daemon=True
+            )
+            self._fusion_thread.start()
+            self._flag_thread = threading.Thread(
+                target=self._flag_loop, name="StopFlagWatch", daemon=True
+            )
+            self._flag_thread.start()
+        except Exception as e:
+            self.last_error = f"fusion/flag start failed: {e}"
+            self.running = False
+            self.state = SessionState.FAILED
+            self._startup_cleanup(stop_audio=True, stop_visual=True, stop_fusion=True)
+            raise
+
         self._status(
             f"课程会话已开始：{self.storage.dir.name} "
-            f"(VLM={self.visual._model}, whisper={self.audio.last_status})"
+            f"(VLM={self.visual._model}, fusion={self.note_engine.model}, "
+            f"whisper={self.audio.last_status})"
         )
+
+    def _startup_cleanup(
+        self,
+        stop_audio: bool,
+        stop_visual: bool,
+        stop_fusion: bool,
+    ) -> None:
+        """Unified cleanup for startup exceptions (stop started workers + release)."""
+        try:
+            self._cleanup_core(
+                stop_visual=stop_visual,
+                stop_audio=stop_audio,
+                stop_fusion=stop_fusion,
+                release_models=True,
+                wait_final_summary=False,
+                failed=True,
+            )
+        except Exception:
+            log.error("startup cleanup failed\n%s", traceback.format_exc())
+            self.storage.clear_active_marker()
 
     def _status(self, msg: str) -> None:
         log.info(msg)
@@ -256,6 +285,11 @@ class CourseSession:
                 log.error("fusion loop error\n%s", traceback.format_exc())
 
     def _fuse_once(self) -> None:
+        """Realtime fusion tick: recent events -> incremental state update.
+
+        Round 4: only mark_model_loaded when fuse() returns True (success).
+        Never registers FINAL_MODEL here — realtime uses REALTIME_FUSION_MODEL.
+        """
         with self._lock:
             if not self._unfused_transcripts and not self._unfused_visuals:
                 return
@@ -265,7 +299,10 @@ class CourseSession:
             self._unfused_visuals.clear()
 
         updated = self.note_engine.fuse(tr, vi)
-        mark_model_loaded(self.note_engine.model)
+        if updated:
+            # fuse() already marked on success; mark here only as a belt-and-braces
+            # for the session's known realtime model (never on False/exception).
+            mark_model_loaded(self.note_engine.model)
         st = self.note_engine.state
         self._status(
             f"增量笔记 #{st.updates}: 主题={st.current_topic or '-'} "
@@ -361,12 +398,9 @@ class CourseSession:
             self._stop_fusion.set()
             if self._fusion_thread:
                 self._fusion_thread.join(timeout=WORKER_JOIN_TIMEOUT)
-
-            # final fusion for any leftovers
-            try:
-                self._fuse_once()
-            except Exception:
-                log.error("final fusion failed", exc_info=True)
+            # NOTE: do NOT run final fusion here. Realtime fusion worker is
+            # already stopped; leftover realtime state flush happens only via
+            # generate_final_summary (FINAL_MODEL) after release + /api/ps gate.
 
         self.storage.finalize_transcript()
         self.running = False
@@ -383,7 +417,8 @@ class CourseSession:
             stop_error = (stop_error + "; " if stop_error else "") + msg
             wait_final_summary = False
 
-        # Release tracked realtime models + /api/ps verify (unified path).
+        # Order (Round 4): stop workers -> join -> release realtime models
+        # -> /api/ps verify -> ONLY THEN optional final fusion/summary (27B).
         if release_models:
             from .final_summary import release_realtime_models
 
@@ -403,6 +438,17 @@ class CourseSession:
                 stop_error = (stop_error + "; " if stop_error else "") + f"release raised: {e}"
                 wait_final_summary = False
                 log.error("release_realtime_models raised", exc_info=True)
+
+        # Verify /api/ps is clean of realtime models before any FINAL_MODEL use.
+        if cleanup_status == CleanupStatus.CLEANUP_OK:
+            from .final_summary import can_load_final_model
+
+            allowed, reason = can_load_final_model()
+            if not allowed:
+                cleanup_status = CleanupStatus.CLEANUP_FAILED
+                stop_error = (stop_error + "; " if stop_error else "") + f"ps gate: {reason}"
+                wait_final_summary = False
+                log.error("ps gate before final phase: %s", reason)
 
         # Audio-fatal path: no full summary, but always write partial notes.
         if failed or self._audio_failed or (self.last_error or "").startswith("audio fatal"):

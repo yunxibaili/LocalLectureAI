@@ -11,7 +11,7 @@ from typing import List, Optional
 from .events import CourseState, TranscriptEvent, VisualEvent
 from .prompts import FUSION_SYSTEM, build_fusion_prompt
 from .settings import (
-    FUSION_MODEL,
+    REALTIME_FUSION_MODEL,
     NUM_CTX_LIVE,
     RECENT_TRANSCRIPT_EVENTS,
     RECENT_VISUAL_EVENTS,
@@ -60,7 +60,7 @@ def _extend_unique(target: List[str], items) -> None:
 class NoteEngine:
     """Applies one fusion delta to the CourseState and renders a live section."""
 
-    def __init__(self, storage: SessionStorage, model: str = FUSION_MODEL) -> None:
+    def __init__(self, storage: SessionStorage, model: str = REALTIME_FUSION_MODEL) -> None:
         self.storage = storage
         self.model = model
         self.state = CourseState()

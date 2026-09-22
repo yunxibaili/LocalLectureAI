@@ -2,6 +2,12 @@
 
 Puts third_party/qlens and third_party/Hearsay/src on sys.path so their
 modules can be imported unmodified (adapter/reuse strategy).
+
+Round 4 model roles (RTX 5070 12GB time-slicing):
+  VISION_MODEL          -> realtime screen analysis (qwen3-vl:8b)
+  REALTIME_FUSION_MODEL -> realtime note fusion (same resident 8B VLM)
+  FINAL_MODEL           -> post-class exclusive (qwen38-27b-main) only after
+                           realtime models are released and /api/ps verified.
 """
 
 from __future__ import annotations
@@ -33,9 +39,10 @@ def _env(name: str, default: str) -> str:
 OLLAMA_URL = _env("OLLAMA_URL", "http://localhost:11434/api/chat")
 VISION_MODEL = _env("VISION_MODEL", "qwen3-vl:8b")
 FALLBACK_VISION_MODEL = _env("FALLBACK_VISION_MODEL", "qwen3-vl:4b")
-# During class, fusion reuses the already-resident VLM (no extra VRAM).
-FUSION_MODEL = _env("FUSION_MODEL", VISION_MODEL)
-# Post-class, exclusive high-quality model.
+# During class, realtime fusion must stay on the resident VLM (never 27B).
+REALTIME_FUSION_MODEL = _env("REALTIME_FUSION_MODEL", VISION_MODEL)
+# Post-class exclusive model. Final fusion + final summary only, and only
+# after realtime models are released and /api/ps verified clean.
 FINAL_MODEL = _env("FINAL_MODEL", "qwen38-27b-main:latest")
 REQUEST_TIMEOUT = int(_env("REQUEST_TIMEOUT", "180"))
 # Grace period added on top of REQUEST_TIMEOUT when joining worker threads
@@ -59,6 +66,38 @@ def ollama_base_url(ollama_url: str | None = None) -> str:
     if not p.scheme or not p.netloc:
         raise ValueError(f"invalid OLLAMA_URL: {raw!r}")
     return f"{p.scheme}://{p.netloc}"
+
+
+def validate_model_config() -> None:
+    """Reject dangerous model-role configs before realtime start.
+
+    Rules (fail closed):
+    - VISION_MODEL / REALTIME_FUSION_MODEL must be non-empty.
+    - Realtime roles must never be FINAL_MODEL or a 27B-class model.
+    - REALTIME_FUSION_MODEL must not equal FINAL_MODEL.
+    """
+    realtime = {VISION_MODEL, REALTIME_FUSION_MODEL}
+    for name in realtime:
+        if not name:
+            raise ValueError("VISION_MODEL / REALTIME_FUSION_MODEL must not be empty")
+        if name == FINAL_MODEL or "27b" in name.lower():
+            raise ValueError(
+                f"invalid realtime model {name!r}: realtime phase must not use "
+                f"{FINAL_MODEL!r} (27B is FINAL-only on 12GB)"
+            )
+    if REALTIME_FUSION_MODEL == FINAL_MODEL:
+        raise ValueError(
+            f"REALTIME_FUSION_MODEL must not equal FINAL_MODEL ({FINAL_MODEL!r})"
+        )
+
+
+def describe_model_roles() -> str:
+    """Human-readable runtime model roles (printed at startup)."""
+    return (
+        f"VISION_MODEL={VISION_MODEL}\n"
+        f"REALTIME_FUSION_MODEL={REALTIME_FUSION_MODEL}\n"
+        f"FINAL_MODEL={FINAL_MODEL}"
+    )
 
 
 # --- Loaded-model registry (what this process actually used) ---
@@ -135,6 +174,15 @@ def is_model_resident(name: str) -> bool | None:
     return False
 
 
+def model_name_matches(a: str, b: str) -> bool:
+    """True if two Ollama model name strings refer to the same model."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return a in b or b in a
+
+
 # --- Cleanup result enum ---
 class CleanupStatus:
     CLEANUP_OK = "CLEANUP_OK"
@@ -145,10 +193,10 @@ class CleanupStatus:
 INFER_SIZE = int(_env("INFER_SIZE", "1024"))
 # absdiff mean threshold (0-255) vs last ANALYZED frame to trigger VLM
 FRAME_DIFF_HIGH = float(_env("FRAME_DIFF_HIGH", "6.0"))
-# lower threshold but require min interval since last analysis (slow writing)
+# lower absdiff threshold (0-255) for slow writing (keep VLM rate low)
 FRAME_DIFF_LOW = float(_env("FRAME_DIFF_LOW", "1.5"))
 MIN_VLM_INTERVAL_S = float(_env("MIN_VLM_INTERVAL_S", "8"))
-# if frame is above LOW this long since last analysis, analyze anyway
+# if frame is above LOW this long without analysis, force one (freshness)
 FORCE_REFRESH_S = float(_env("FORCE_REFRESH_S", "30"))
 FRAME_POLL_S = float(_env("FRAME_POLL_S", "1.0"))
 

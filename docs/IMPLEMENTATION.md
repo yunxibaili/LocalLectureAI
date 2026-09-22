@@ -25,11 +25,11 @@ start_course.ps1
 | 阶段 | 模型 | 说明 |
 |---|---|---|
 | 实时视觉 | `qwen3-vl:8b`（回退 `qwen3-vl:4b`） | 门控后单次调用，图像 1024px |
-| 实时融合 | 同 `qwen3-vl:8b`（`FUSION_MODEL`，文本复用已驻留 VLM） | 不另载 27B |
+| 实时融合 | 同 `qwen3-vl:8b`（`REALTIME_FUSION_MODEL`，文本复用已驻留 VLM） | 不另载 27B |
 | 课后总结 | `qwen38-27b-main:latest` | 先 `释放实时视觉模型` 再加载 |
 | Whisper | `faster-whisper turbo`, language=zh, device=auto | Hearsay venv 内置 |
 
-环境变量均由 `settings.py` 读取，`start_course.ps1` 提供默认值。
+环境变量均由 `settings.py` 读取，`start_course.ps1` 仅提供默认 env 值（不覆盖 Python settings 语义）。
 
 ## Upstream 最小修改（权威 diff）
 
