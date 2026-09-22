@@ -39,30 +39,23 @@ def _managed_realtime_models() -> set[str]:
     return {m for m in (VISION_MODEL, REALTIME_FUSION_MODEL) if m}
 
 
-def release_realtime_models(exclude: set[str] | None = None) -> tuple[bool, list[str]]:
-    """Release realtime models based on /api/ps (authoritative).
+def _release_named_models(names: set[str]) -> tuple[bool, list[str]]:
+    """Unload exactly `names` based on /api/ps; never touch other models.
 
-    Hard constraints:
-    - Targets only VISION_MODEL / REALTIME_FUSION_MODEL (this app's roles).
-    - Never touches other Ollama models (do not kill unrelated processes).
-    - registry is NOT the source of truth: if /api/ps shows a managed
-      model resident, unload it even when registry is empty.
-    - unload -> /api/ps -> retry -> still resident after retries = FAIL.
-    - /api/ps query failure (None) = FAIL (cannot verify).
-
-    Returns (success, error_messages).
+    Returns (success, error_messages). /api/ps None → FAIL.
     """
     import requests
 
-    exclude = exclude or set()
-    managed = _managed_realtime_models() - exclude
+    targets_in = sorted(n for n in names if n)
+    if not targets_in:
+        return True, []
 
     resident_before = list_loaded_models_via_api()
     if resident_before is None:
         return False, ["cannot verify /api/ps before release"]
 
     targets = sorted(
-        m for m in managed if any(model_name_matches(m, r) for r in resident_before)
+        m for m in targets_in if any(model_name_matches(m, r) for r in resident_before)
     )
     if not targets:
         return True, []
@@ -131,6 +124,44 @@ def release_realtime_models(exclude: set[str] | None = None) -> tuple[bool, list
     if still_resident:
         return False, errors + [f"STILL RESIDENT: {', '.join(still_resident)}"]
     return True, errors
+
+
+def release_realtime_models(exclude: set[str] | None = None) -> tuple[bool, list[str]]:
+    """Release realtime models based on /api/ps (authoritative).
+
+    Hard constraints:
+    - Targets only VISION_MODEL / REALTIME_FUSION_MODEL (this app's roles).
+    - Never touches other Ollama models (do not kill unrelated processes).
+    - registry is NOT the source of truth: if /api/ps shows a managed
+      model resident, unload it even when registry is empty.
+    - unload -> /api/ps -> retry -> still resident after retries = FAIL.
+    - /api/ps query failure (None) = FAIL (cannot verify).
+
+    Returns (success, error_messages).
+    """
+    exclude = exclude or set()
+    managed = _managed_realtime_models() - exclude
+    return _release_named_models(managed)
+
+
+def release_final_model() -> tuple[bool, list[str]]:
+    """Unload ONLY FINAL_MODEL after final fusion/summary; verify via /api/ps.
+
+    Never unloads unrelated Ollama models. /api/ps failure → FAIL.
+    """
+    if not FINAL_MODEL:
+        return True, []
+    return _release_named_models({FINAL_MODEL})
+
+
+def is_final_model_resident() -> bool | None:
+    """True/False if FINAL_MODEL is in /api/ps; None if cannot query."""
+    resident = list_loaded_models_via_api()
+    if resident is None:
+        return None
+    if not FINAL_MODEL:
+        return False
+    return any(model_name_matches(FINAL_MODEL, r) for r in resident)
 
 
 def can_load_final_model() -> tuple[bool, str]:
@@ -310,3 +341,85 @@ def generate_final_summary(
     storage.final_summary_path.write_text(header + summary + "\n", encoding="utf-8")
     _st(f"final_summary.md 已写入: {storage.final_summary_path}")
     return str(storage.final_summary_path)
+
+
+def run_final_phase(
+    storage: SessionStorage,
+    status: Optional[Callable[[str], None]] = None,
+    *,
+    pending_transcripts: Optional[list] = None,
+    pending_visuals: Optional[list] = None,
+    note_engine=None,
+) -> tuple[Optional[str], Optional[str], list[str]]:
+    """FINAL phase: Final Fusion → Final Summary → release FINAL_MODEL.
+
+    Caller must already have released realtime models and passed
+    can_load_final_model(). This function:
+      1. fuse_final (no-op when no pending events — does not force 27B)
+      2. generate_final_summary
+      3. finally: release_final_model + /api/ps verify
+
+    Returns (fusion_status, summary_path, errors).
+    fusion_status: "success" | "no-op" | "failure" | None (summary-only path).
+    """
+    def _st(msg: str) -> None:
+        log.info(msg)
+        if status:
+            try:
+                status(msg)
+            except Exception:
+                pass
+
+    errors: list[str] = []
+    fusion_status: Optional[str] = None
+    summary_path: Optional[str] = None
+    pending_transcripts = pending_transcripts or []
+    pending_visuals = pending_visuals or []
+
+    try:
+        # --- Final Fusion (explicit FINAL_MODEL; no-op if nothing pending) ---
+        if note_engine is not None:
+            if not pending_transcripts and not pending_visuals:
+                fusion_status = "no-op"
+                _st("No pending fusion work.")
+            else:
+                _st(f"Final Fusion（{FINAL_MODEL}）处理 pending events…")
+                from .note_engine import fuse_final_status_safe
+
+                fusion_status = fuse_final_status_safe(
+                    note_engine, pending_transcripts, pending_visuals, FINAL_MODEL
+                )
+                if fusion_status == "failure":
+                    errors.append("final fusion failed")
+                    _st("Final Fusion 失败")
+                elif fusion_status == "no-op":
+                    _st("No pending fusion work.")
+                else:
+                    _st(f"Final Fusion 完成: {fusion_status}")
+
+        # --- Final Summary (always attempted when we got this far) ---
+        # Re-check gate immediately before loading FINAL_MODEL for summary.
+        allowed, reason = can_load_final_model()
+        if not allowed:
+            errors.append(f"ps gate before summary: {reason}")
+            return fusion_status, None, errors
+
+        summary_path = generate_final_summary(storage, status)
+    finally:
+        # --- FINAL_MODEL cleanup always (even on fusion/summary failure) ---
+        try:
+            rel_ok, rel_errs = release_final_model()
+            if not rel_ok:
+                errors.extend(rel_errs or ["final model release failed"])
+                resident = is_final_model_resident()
+                if resident is True:
+                    errors.append(f"FINAL_MODEL still resident: {FINAL_MODEL}")
+                elif resident is None:
+                    errors.append("cannot verify /api/ps after final release")
+            elif rel_errs:
+                log.warning("final release warnings: %s", "; ".join(rel_errs))
+        except Exception as e:
+            errors.append(f"final release raised: {e}")
+            log.error("release_final_model raised", exc_info=True)
+
+    return fusion_status, summary_path, errors

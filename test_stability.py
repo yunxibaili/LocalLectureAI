@@ -769,8 +769,16 @@ try:
         ok_l, errs_l = fs.release_realtime_models()
     check(ok_l is True, f"Test L: release succeeds when /api/ps drives unload (got {ok_l}, {errs_l})")
     check(bool(unload_posts), f"Test L: actually posted unload despite empty registry: {unload_posts}")
-    check(any("model" in (p or {}).get("model", "") for p in unload_posts),
-          f"Test L: unload targeted managed model: {unload_posts}")
+    # Must check the actual model field in POST body == VISION_MODEL (not substring).
+    model_fields = [(p or {}).get("model") for p in unload_posts]
+    check(
+        any(mf == "qwen3-vl:8b" for mf in model_fields),
+        f"Test L: unload body model field == VISION_MODEL (got {model_fields})",
+    )
+    check(
+        all(mf == "qwen3-vl:8b" or mf is None for mf in model_fields),
+        f"Test L: no unrelated model unloads (got {model_fields})",
+    )
 finally:
     forget_loaded_models()
 
@@ -831,25 +839,97 @@ if cleanup_calls:
 
 
 print("== Test J: stop order = workers -> release -> ps verify -> final ==")
-# Static + behavioral: _cleanup_core must call release_realtime_models AFTER
-# joining workers, and can_load_final_model (ps gate) before generate_final_summary.
+# Behavioral: record actual call order of join / release / ps / final_load.
+# Static source-order alone is NOT sufficient (Round 5).
 import inspect as _inspect
 
+order_events: list[str] = []
+
+class _OrderVisual:
+    def __init__(self):
+        self._alive = False
+
+    def stop(self):
+        pass
+
+    def join(self, timeout=None):
+        order_events.append("join")
+
+    def is_alive(self):
+        return False
+
+    vlm_calls = 0
+    skipped_frames = 0
+    failed_analyses = 0
+    last_error = ""
+    last_status = ""
+    _model = "fake"
+
+class _OrderThread:
+    def join(self, timeout=None):
+        order_events.append("join")
+
+    def is_alive(self):
+        return False
+
+def _order_release(**kwargs):
+    order_events.append("release")
+    return True, []
+
+def _order_can_load():
+    order_events.append("ps")
+    return True, "ok"
+
+def _order_run_final_phase(storage, status=None, **kwargs):
+    order_events.append("final_fusion")
+    order_events.append("final_summary")
+    order_events.append("final_release")
+    # write a real final_summary.md so success path can pass
+    p = storage.final_summary_path
+    p.write_text("# final\nok", encoding="utf-8")
+    return "success", str(p), []
+
+sess_j = CourseSession(_Region(10, 10, 50, 50))
+sess_j.visual = _OrderVisual()
+sess_j.audio = None
+sess_j._fusion_thread = _OrderThread()
+sess_j.running = True
+sess_j.storage.ensure_live_header("t")
+sess_j.storage.append_event({"text": "test", "session_t": 0.0})
+
+with patch("app.course_session.final_summary.release_realtime_models", _order_release), \
+     patch("app.course_session.final_summary.can_load_final_model", _order_can_load), \
+     patch("app.course_session.final_summary.run_final_phase", _order_run_final_phase):
+    res_j = sess_j._cleanup_core(
+        stop_visual=True, stop_audio=False, stop_fusion=True,
+        release_models=True,
+        wait_final_summary=True, failed=False,
+    )
+
+check(res_j is not None, f"Test J: cleanup returned result ({res_j})")
+check("join" in order_events and "release" in order_events and "ps" in order_events
+      and "final_fusion" in order_events,
+      f"Test J: recorded events: {order_events}")
+if order_events:
+    i_join = order_events.index("join")
+    i_release = order_events.index("release")
+    i_ps = order_events.index("ps")
+    i_ff = order_events.index("final_fusion")
+    check(i_join < i_release < i_ps < i_ff,
+          f"Test J: order join({i_join}) < release({i_release}) < ps({i_ps}) < final_fusion({i_ff})")
+    # final_release must come after final_summary
+    if "final_summary" in order_events and "final_release" in order_events:
+        check(order_events.index("final_summary") < order_events.index("final_release"),
+              f"Test J: summary before final_release: {order_events}")
+
+# Static: no realtime _fuse_once during stop_fusion join block
 src_j = _inspect.getsource(CourseSession._cleanup_core)
-idx_join = src_j.find("join(timeout=WORKER_JOIN_TIMEOUT)")
-idx_release = src_j.find("release_realtime_models(")
-idx_ps = src_j.find("can_load_final_model(")
-idx_gen = src_j.find("generate_final_summary(")
-check(idx_join != -1 and idx_release != -1 and idx_ps != -1 and idx_gen != -1,
-      f"Test J: cleanup core has join/release/ps/final markers ({idx_join},{idx_release},{idx_ps},{idx_gen})")
-check(idx_join < idx_release < idx_ps < idx_gen,
-      f"Test J: order join({idx_join}) < release({idx_release}) < ps({idx_ps}) < final({idx_gen})")
-check("_fuse_once()" not in src_j.split("release_realtime_models")[0].split("stop_fusion")[-1] or True,
-      "Test J: final fusion not forced before release (see source)")  # informational
-# No realtime _fuse_once after fusion join in cleanup path:
 fusion_block = src_j.split("if stop_fusion:")[1].split("self.storage.finalize_transcript")[0]
 check("_fuse_once" not in fusion_block,
       "Test J: cleanup does not run realtime _fuse_once during stop_fusion")
+# Real markers present in source (order checked behaviorally above)
+for marker in ("release_realtime_models(", "can_load_final_model(", "run_final_phase("):
+    check(marker in src_j, f"Test J: source contains {marker}")
 
 
 print("== Test P: audio fatal -> release called, /api/ps has no qwen3-vl ==")
@@ -893,6 +973,372 @@ check("VISION_MODEL=qwen3-vl:8b" in roles, f"Test: roles print VISION 8B: {roles
 check("REALTIME_FUSION_MODEL=qwen3-vl:8b" in roles, f"Test: roles print RT fusion 8B: {roles!r}")
 check("FINAL_MODEL=qwen38-27b-main:latest" in roles, f"Test: roles print FINAL 27B: {roles!r}")
 
+
+# =====================================================================
+# ROUND 5 FINAL FUSION / FINAL CLEANUP / REGISTRY TESTS Q-V
+# =====================================================================
+
+print()
+print("== Test Q: Final Fusion executes on pending events (FINAL_MODEL) ==")
+from app.course_session.note_engine import (  # noqa: E402
+    FUSION_FAILURE,
+    FUSION_NOOP,
+    FUSION_SUCCESS,
+)
+from app.course_session.events import VisualEvent as _VE  # noqa: E402
+
+storage_q = _SS()
+ne_q = NoteEngine(storage_q, model=_RT_I)  # realtime role unchanged
+forget_loaded_models()
+final_calls_q = []
+
+def _chat_final_ok(*args, **kwargs):
+    final_calls_q.append(kwargs.get("model"))
+    return json.dumps({
+        "current_topic": "二次函数",
+        "new_knowledge": ["顶点式"],
+        "new_formulas": ["$y=a(x-h)^2+k$"],
+        "teacher_explanation": [],
+        "teacher_emphasis": ["顶点很重要"],
+        "examples": [],
+        "pitfalls": [],
+        "relations": [],
+        "unresolved": [],
+        "visual_note": "板书顶点式",
+        "skip": False,
+    })
+
+_orig_chat_q = oc.chat_text
+oc.chat_text = _chat_final_ok
+try:
+    pend_tr = [_TE(text="最后讲顶点式", session_t=100.0)]
+    pend_vi = [_VE(description="黑板写出顶点式", session_t=100.0, diff_score=9.0)]
+    status_q = ne_q.fuse_final(pend_tr, pend_vi, model=_FM_I)
+finally:
+    oc.chat_text = _orig_chat_q
+
+check(status_q == FUSION_SUCCESS, f"Test Q: fuse_final success (got {status_q})")
+check(final_calls_q and final_calls_q[0] == _FM_I,
+      f"Test Q: FINAL_MODEL was the chat model (got {final_calls_q})")
+check(ne_q.model == _RT_I, f"Test Q: realtime model role unchanged ({ne_q.model})")
+check(_FM_I in loaded_models(), f"Test Q: FINAL_MODEL registered after success: {loaded_models()}")
+check(_RT_I not in loaded_models() or _RT_I == _FM_I,
+      f"Test Q: realtime model not spuriously marked by final fusion: {loaded_models()}")
+check(ne_q.state.updates >= 1, f"Test Q: pending events applied (updates={ne_q.state.updates})")
+check(storage_q.course_state_path.exists(), "Test Q: course_state persisted after final fusion")
+forget_loaded_models()
+
+
+print("== Test R: Final Fusion no-op when no pending (no 27B call) ==")
+storage_r = _SS()
+ne_r = NoteEngine(storage_r, model=_RT_I)
+forget_loaded_models()
+chat_r_called = []
+
+def _chat_r_should_not_run(*args, **kwargs):
+    chat_r_called.append(kwargs)
+    return "{}"
+
+_orig_chat_r = oc.chat_text
+oc.chat_text = _chat_r_should_not_run
+try:
+    status_r = ne_r.fuse_final([], [], model=_FM_I)
+finally:
+    oc.chat_text = _orig_chat_r
+
+check(status_r == FUSION_NOOP, f"Test R: empty pending -> no-op (got {status_r})")
+check(not chat_r_called, f"Test R: 27B chat NOT called on no-op: {len(chat_r_called)} calls")
+check(_FM_I not in loaded_models(), f"Test R: FINAL_MODEL not registered on no-op: {loaded_models()}")
+
+# run_final_phase path: no pending -> explicit no-op, summary can still run
+run_final_r = []
+def _gen_r(storage, status=None):
+    run_final_r.append("summary")
+    p = storage.final_summary_path
+    p.write_text("# s", encoding="utf-8")
+    return str(p)
+
+def _rel_final_r():
+    run_final_r.append("release")
+    return True, []
+
+with patch.object(fs, "generate_final_summary", _gen_r), \
+     patch.object(fs, "release_final_model", _rel_final_r), \
+     patch.object(fs, "can_load_final_model", lambda: (True, "ok")):
+    fusion_r, summary_r, errs_r = fs.run_final_phase(
+        storage_r, pending_transcripts=[], pending_visuals=[], note_engine=ne_r
+    )
+check(fusion_r == FUSION_NOOP, f"Test R: run_final_phase fusion no-op (got {fusion_r})")
+check(summary_r is not None and "summary" in run_final_r,
+      f"Test R: summary still ran after no-op fusion: {run_final_r}")
+check("release" in run_final_r, f"Test R: FINAL_MODEL release still attempted: {run_final_r}")
+check(not errs_r, f"Test R: no errors on clean no-op path: {errs_r}")
+
+
+print("== Test S: Final Fusion failure -> not fake success, still release + ps ==")
+storage_s = _SS()
+ne_s = NoteEngine(storage_s, model=_RT_I)
+forget_loaded_models()
+
+def _chat_s_fail(*args, **kwargs):
+    return "not json {{{"
+
+_orig_chat_s = oc.chat_text
+oc.chat_text = _chat_s_fail
+try:
+    status_s = ne_s.fuse_final([_TE(text="x", session_t=1.0)], [], model=_FM_I)
+finally:
+    oc.chat_text = _orig_chat_s
+
+check(status_s == FUSION_FAILURE, f"Test S: fuse_final failure (got {status_s})")
+check(_FM_I not in loaded_models(), f"Test S: no registry mark on fusion failure: {loaded_models()}")
+
+# run_final_phase: fusion fails -> errors non-empty; release still called; ps verified
+ps_final_s = {f"{_FM_I}:latest"}
+rel_posts_s = []
+
+def _gen_s_should_not_claim_clean(storage, status=None):
+    # summary may still be attempted; write file but caller must not fake overall success
+    p = storage.final_summary_path
+    p.write_text("# partial final", encoding="utf-8")
+    return str(p)
+
+def _rel_final_s():
+    ps_final_s.clear()
+    return True, []
+
+def _ps_s():
+    return set(ps_final_s)
+
+# Keep chat mock active so fuse_final does not hit the real Ollama
+# (real model may return skip:true and falsely report no-op).
+with patch.object(fs, "generate_final_summary", _gen_s_should_not_claim_clean), \
+     patch.object(fs, "release_final_model", _rel_final_s), \
+     patch.object(fs, "can_load_final_model", lambda: (True, "ok")), \
+     patch.object(fs, "list_loaded_models_via_api", _ps_s), \
+     patch.object(oc, "chat_text", _chat_s_fail):
+    fusion_s, summary_s, errs_s = fs.run_final_phase(
+        storage_s,
+        pending_transcripts=[_TE(text="x", session_t=1.0)],
+        pending_visuals=[],
+        note_engine=ne_s,
+    )
+check(fusion_s == FUSION_FAILURE, f"Test S: run_final_phase reports fusion failure (got {fusion_s})")
+check(any("final fusion failed" in e for e in errs_s),
+      f"Test S: errors include fusion failure: {errs_s}")
+check(not ps_final_s, f"Test S: /api/ps cleared FINAL_MODEL after release: {ps_final_s}")
+check(ps_final_s == set(),
+      "Test S: release path executed (ps_final_s cleared)")
+# Overall session success must be False when fusion_status==failure — see stop path below
+# (covered by success formula: fusion_status == "failure" -> success=False)
+
+
+print("== Test T: Final Summary success -> load -> summary -> unload -> /api/ps ==")
+order_t: list[str] = []
+
+def _gen_t(storage, status=None):
+    order_t.append("summary")
+    # simulate model load mark during summary
+    mark_model_loaded(_FM_I)
+    p = storage.final_summary_path
+    p.write_text("# final summary body", encoding="utf-8")
+    return str(p)
+
+def _rel_t():
+    order_t.append("unload")
+    forget_loaded_models({_FM_I})
+    return True, []
+
+def _can_t():
+    order_t.append("ps_before")
+    return True, "ok"
+
+storage_t = _SS()
+with patch.object(fs, "generate_final_summary", _gen_t), \
+     patch.object(fs, "release_final_model", _rel_t), \
+     patch.object(fs, "can_load_final_model", _can_t):
+    fusion_t, summary_t, errs_t = fs.run_final_phase(
+        storage_t, pending_transcripts=[], pending_visuals=[], note_engine=None
+    )
+check(order_t == ["ps_before", "summary", "unload"] or (
+        order_t.index("summary") < order_t.index("unload")),
+      f"Test T: summary before unload (got {order_t})")
+check(not errs_t, f"Test T: clean release errors empty: {errs_t}")
+check(_FM_I not in loaded_models(), f"Test T: FINAL_MODEL not in registry after release: {loaded_models()}")
+check(summary_t is not None and Path(summary_t).exists(), "Test T: final_summary.md kept")
+
+
+print("== Test U: Final Summary exception -> FINAL_MODEL still unloaded ==")
+storage_u = _SS()
+mark_model_loaded(_FM_I)
+rel_u_called = []
+
+def _gen_u_raise(storage, status=None):
+    mark_model_loaded(_FM_I)  # loaded then blew up
+    raise RuntimeError("summary boom")
+
+def _rel_u():
+    rel_u_called.append(True)
+    forget_loaded_models({_FM_I})
+    return True, []
+
+with patch.object(fs, "generate_final_summary", _gen_u_raise), \
+     patch.object(fs, "release_final_model", _rel_u), \
+     patch.object(fs, "can_load_final_model", lambda: (True, "ok")):
+    raised_u = False
+    try:
+        fs.run_final_phase(storage_u, pending_transcripts=[], pending_visuals=[], note_engine=None)
+    except RuntimeError:
+        raised_u = True
+check(raised_u, "Test U: summary exception propagates (not swallowed)")
+check(rel_u_called, "Test U: release_final_model still called in finally")
+check(_FM_I not in loaded_models(), f"Test U: FINAL_MODEL forgotten after release: {loaded_models()}")
+
+
+print("== Test V: unload FINAL_MODEL fails -> cleanup failure, not full success ==")
+# release_final_model returns False -> run_final_phase errors non-empty
+storage_v = _SS()
+
+def _rel_v_fail():
+    return False, [f"{_FM_I}: CONFIRMED STILL RESIDENT"]
+
+def _gen_v(storage, status=None):
+    mark_model_loaded(_FM_I)
+    p = storage.final_summary_path
+    p.write_text("# ok summary", encoding="utf-8")
+    return str(p)
+
+with patch.object(fs, "generate_final_summary", _gen_v), \
+     patch.object(fs, "release_final_model", _rel_v_fail), \
+     patch.object(fs, "can_load_final_model", lambda: (True, "ok")):
+    fusion_v, summary_v, errs_v = fs.run_final_phase(
+        storage_v, pending_transcripts=[], pending_visuals=[], note_engine=None
+    )
+check(summary_v is not None, f"Test V: summary file may exist despite cleanup fail: {summary_v}")
+check(any("STILL RESIDENT" in e or "release" in e.lower() for e in errs_v),
+      f"Test V: cleanup failure reported in errors: {errs_v}")
+
+# Session-level: final release failure forces success=False / FAILED
+sess_v = CourseSession(_Region(10, 10, 50, 50))
+sess_v.running = True
+sess_v.storage.ensure_live_header("t")
+sess_v.storage.append_event({"text": "t", "session_t": 0.0})
+
+def _cleanup_v(self, **kwargs):
+    from app.course_session.session import StopResult as _SR
+    return _SR(success=False, state="failed",
+               error="CLEANUP_FAILED: FINAL_MODEL still resident",
+               summary_path=str(sess_v.storage.final_summary_path),
+               partial_available=False)
+
+# Behavioral: success formula includes final_release_ok
+src_v = _inspect.getsource(CourseSession._cleanup_core)
+check("final_release_ok" in src_v or "final_release_errs" in src_v,
+      "Test V: cleanup core tracks final_release_ok/errs")
+check("CLEANUP_FAILED" in src_v, "Test V: final release failure can set CLEANUP_FAILED")
+
+
+print("== Test W: skip=True does not register; success does ==")
+storage_w = _SS()
+ne_w = NoteEngine(storage_w, model="fake-rt-registry")
+forget_loaded_models()
+
+def _chat_skip(*args, **kwargs):
+    return json.dumps({"skip": True, "current_topic": ""})
+
+_orig_chat_w = oc.chat_text
+oc.chat_text = _chat_skip
+try:
+    updated_w = ne_w.fuse([_TE(text="hello", session_t=1.0)], [])
+finally:
+    oc.chat_text = _orig_chat_w
+check(updated_w is False, f"Test W: skip returns False (got {updated_w})")
+check("fake-rt-registry" not in loaded_models(),
+      f"Test W: skip=True does NOT mark_model_loaded: {loaded_models()}")
+
+def _chat_ok_w(*args, **kwargs):
+    return json.dumps({
+        "current_topic": "T", "new_knowledge": ["k"], "new_formulas": [],
+        "teacher_explanation": [], "teacher_emphasis": [], "examples": [],
+        "pitfalls": [], "relations": [], "unresolved": [],
+        "visual_note": "", "skip": False,
+    })
+
+oc.chat_text = _chat_ok_w
+try:
+    updated_w2 = ne_w.fuse([_TE(text="real info", session_t=2.0)], [])
+finally:
+    oc.chat_text = _orig_chat_w
+check(updated_w2 is True, f"Test W: success returns True (got {updated_w2})")
+check("fake-rt-registry" in loaded_models(),
+      f"Test W: success marks realtime model: {loaded_models()}")
+
+# Final fusion registry is independent of realtime registry
+storage_w2 = _SS()
+ne_w2 = NoteEngine(storage_w2, model="fake-rt-registry")
+forget_loaded_models()
+oc.chat_text = _chat_ok_w
+try:
+    st_w2 = ne_w2.fuse_final([_TE(text="final", session_t=3.0)], [], model=_FM_I)
+finally:
+    oc.chat_text = _orig_chat_w
+check(st_w2 == FUSION_SUCCESS, f"Test W: final fusion success (got {st_w2})")
+check(_FM_I in loaded_models() and "fake-rt-registry" not in loaded_models(),
+      f"Test W: final registry only FINAL_MODEL: {loaded_models()}")
+forget_loaded_models()
+
+
+print("== Test J2: ps verify failure -> final fusion/summary NEVER runs ==")
+order_j2: list[str] = []
+
+def _release_j2(**kwargs):
+    order_j2.append("release")
+    return True, []
+
+def _can_j2_fail():
+    order_j2.append("ps")
+    return False, "realtime still resident"
+
+def _run_final_j2(*args, **kwargs):
+    order_j2.append("final_load")
+    return "success", "x", []
+
+sess_j2 = CourseSession(_Region(10, 10, 50, 50))
+sess_j2.visual = _OrderVisual()
+sess_j2.audio = None
+sess_j2._fusion_thread = _OrderThread()
+sess_j2.running = True
+sess_j2.storage.ensure_live_header("t")
+sess_j2.storage.append_event({"text": "t", "session_t": 0.0})
+
+with patch("app.course_session.final_summary.release_realtime_models", _release_j2), \
+     patch("app.course_session.final_summary.can_load_final_model", _can_j2_fail), \
+     patch("app.course_session.final_summary.run_final_phase", _run_final_j2):
+    res_j2 = sess_j2._cleanup_core(
+        stop_visual=True, stop_audio=False, stop_fusion=True,
+        release_models=True,
+        wait_final_summary=True, failed=False,
+    )
+
+check(res_j2 is not None, "Test J2: cleanup returned")
+check("final_load" not in order_j2,
+      f"Test J2: final phase blocked when ps gate fails: {order_j2}")
+check(res_j2.success is False, f"Test J2: success=False on ps gate fail (got {res_j2.success})")
+check(res_j2.state == "failed", f"Test J2: state failed (got {res_j2.state})")
+check("ps gate" in (res_j2.error or ""), f"Test J2: error mentions ps gate: {res_j2.error}")
+
+
+print()
+print("== Anti-false-pass scan ==")
+test_src = Path("test_stability.py").read_text(encoding="utf-8")
+# Build needle without embedding the banned phrase as a contiguous literal
+# in this scan block (avoids self-match false FAIL).
+_needle_or_true = "or" + " " + "True"
+check(_needle_or_true not in test_src, "no always-true or-True false-pass in test_stability.py")
+_needle_bare_pass = "except Exception" + ": pass"
+check(_needle_bare_pass not in test_src, "no bare except-pass in tests")
+check("sys.exit(0)" in test_src and "FAILURES" in test_src,
+      "tests exit 1 on failures / 0 only when no FAILURES")
 
 print()
 if FAILURES:

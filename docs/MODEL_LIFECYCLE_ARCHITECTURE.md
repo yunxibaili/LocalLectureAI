@@ -31,13 +31,14 @@ REALTIME_CLEANUP   # release VISION/REALTIME_FUSION via /api/ps
 VERIFY_NO_REALTIME # /api/ps must not show 8B VLM
  ↓
 FINAL              # load qwen38-27b → final fusion + summary
- ↓
-FINAL_CLEANUP      # optional unload of 27B
- ↓
+  ↓
+FINAL_CLEANUP      # unload qwen38-27b + /api/ps verify (required)
+  ↓
 STOPPED
 
 any cleanup verification failure → FAILED
 FAILED must not continue into FINAL (no 27B load)
+FINAL without successful FINAL_CLEANUP must not report STOPPED success
 ```
 
 ## Why time-slicing on 12GB
@@ -64,6 +65,27 @@ Gates:
    (no realtime models in `/api/ps`) before any `FINAL_MODEL` call.
 4. **Startup exception**: always `_cleanup_core` (stop started workers +
    release + verify), never a bare `audio.stop()`.
+5. **Final Fusion** runs only after realtime release + `/api/ps` clean +
+   `can_load_final_model()`. No pending events → explicit no-op (does not
+   force a 27B call).
+6. **Final Summary** runs after Final Fusion (never substitutes for it).
+7. **FINAL_CLEANUP**: after Final Fusion + Final Summary (success or failure),
+   unload **only** `FINAL_MODEL` and verify via `/api/ps`. Unload failure →
+   cleanup failed → not STOPPED success. Never unload unrelated models.
+
+## Lifecycle order (authoritative)
+
+```
+stop workers → join → verify workers dead
+  → release VISION_MODEL / REALTIME_FUSION_MODEL
+  → /api/ps confirm realtime models gone
+  → allow FINAL_MODEL (can_load_final_model)
+  → Final Fusion (pending events → CourseState / live notes)
+  → Final Summary (final_summary.md)
+  → release FINAL_MODEL
+  → /api/ps confirm FINAL_MODEL gone
+  → STOPPED
+```
 
 ## What is forbidden
 
@@ -71,7 +93,9 @@ Gates:
 - Loading `FINAL_MODEL` while any realtime worker is alive.
 - Loading `FINAL_MODEL` when `/api/ps` still shows realtime models.
 - Preflight succeeding when `/api/ps` cannot be queried.
-- `mark_model_loaded` on fuse failure / skip / exception.
+- `mark_model_loaded` on fuse failure / skip / exception (realtime or final).
+- Skipping Final Fusion while pending events exist without an explicit no-op path.
+- Leaving `FINAL_MODEL` resident after Final Summary (must unload + verify).
 - Shell override of `FUSION_MODEL` or any hidden realtime=27B mapping.
 - Inventing model tags that do not exist on the machine (use `qwen3-vl:8b`).
 

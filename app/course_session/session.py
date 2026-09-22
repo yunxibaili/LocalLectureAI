@@ -300,8 +300,8 @@ class CourseSession:
 
         updated = self.note_engine.fuse(tr, vi)
         if updated:
-            # fuse() already marked on success; mark here only as a belt-and-braces
-            # for the session's known realtime model (never on False/exception).
+            # fuse() only returns True after applying a real delta.
+            # False (skip/failure) must never mark_model_loaded (Round 5).
             mark_model_loaded(self.note_engine.model)
         st = self.note_engine.state
         self._status(
@@ -398,9 +398,9 @@ class CourseSession:
             self._stop_fusion.set()
             if self._fusion_thread:
                 self._fusion_thread.join(timeout=WORKER_JOIN_TIMEOUT)
-            # NOTE: do NOT run final fusion here. Realtime fusion worker is
-            # already stopped; leftover realtime state flush happens only via
-            # generate_final_summary (FINAL_MODEL) after release + /api/ps gate.
+            # Realtime fusion worker is stopped here. Leftover pending events
+            # are drained later by Final Fusion (FINAL_MODEL) only after
+            # release + /api/ps gate — never via the realtime fusion tick.
 
         self.storage.finalize_transcript()
         self.running = False
@@ -417,8 +417,9 @@ class CourseSession:
             stop_error = (stop_error + "; " if stop_error else "") + msg
             wait_final_summary = False
 
-        # Order (Round 4): stop workers -> join -> release realtime models
-        # -> /api/ps verify -> ONLY THEN optional final fusion/summary (27B).
+        # Order (Round 5): stop workers -> join -> release realtime models
+        # -> /api/ps verify -> ONLY THEN final fusion + summary (27B)
+        # -> release FINAL_MODEL -> /api/ps verify.
         if release_models:
             from .final_summary import release_realtime_models
 
@@ -458,18 +459,73 @@ class CourseSession:
         if cleanup_status != CleanupStatus.CLEANUP_OK:
             wait_final_summary = False
 
-        if wait_final_summary:
-            from .final_summary import generate_final_summary
+        fusion_status: Optional[str] = None
+        final_release_ok = True
+        final_release_errs: list[str] = []
 
-            self._status("正在生成课后总结（qwen38-27b 独占加载）…")
+        if wait_final_summary:
+            from .final_summary import run_final_phase
+
+            # Drain pending events under lock BEFORE final phase (post-join).
+            with self._lock:
+                pend_tr = self._unfused_transcripts[:]
+                pend_vi = self._unfused_visuals[:]
+                self._unfused_transcripts.clear()
+                self._unfused_visuals.clear()
+
+            self._status(
+                f"正在 Final Fusion + 课后总结（{self._note_final_model()} 独占加载）…"
+            )
             try:
-                summary_path = generate_final_summary(self.storage, self._status)
-                self._status(f"完成: {summary_path}")
+                fusion_status, summary_path, final_errs = run_final_phase(
+                    self.storage,
+                    self._status,
+                    pending_transcripts=pend_tr,
+                    pending_visuals=pend_vi,
+                    note_engine=self.note_engine,
+                )
+                if final_errs:
+                    msg = "; ".join(final_errs)
+                    stop_error = (stop_error + "; " if stop_error else "") + msg
+                    self.last_error = self.last_error or msg
+                    # fusion/summary failure or final-model release failure
+                    if any(
+                        "release" in e.lower()
+                        or "resident" in e.lower()
+                        or "cannot verify" in e.lower()
+                        for e in final_errs
+                    ):
+                        cleanup_status = CleanupStatus.CLEANUP_FAILED
+                    if fusion_status == "failure":
+                        log.error("final fusion failed: %s", msg)
+                    if summary_path:
+                        self._status(f"完成(部分): {summary_path}")
+                    else:
+                        self._status(f"课后阶段失败: {msg}")
+                elif summary_path:
+                    self._status(f"完成: {summary_path}")
+                if fusion_status:
+                    self._status(f"Final Fusion status={fusion_status}")
             except Exception as e:
-                stop_error = f"final summary failed: {e}"
+                stop_error = f"final phase failed: {e}"
                 self.last_error = stop_error
-                log.error("final summary failed\n%s", traceback.format_exc())
-                self._status(f"课后总结失败: {e}")
+                log.error("final phase failed\n%s", traceback.format_exc())
+                self._status(f"课后阶段失败: {e}")
+                # still attempt FINAL_MODEL release if run_final_phase aborted early
+                try:
+                    from .final_summary import release_final_model
+
+                    final_release_ok, final_release_errs = release_final_model()
+                    if not final_release_ok:
+                        cleanup_status = CleanupStatus.CLEANUP_FAILED
+                        stop_error = (
+                            stop_error + "; "
+                        ) + "final release after error: " + (
+                            "; ".join(final_release_errs) or "unknown"
+                        )
+                except Exception:
+                    cleanup_status = CleanupStatus.CLEANUP_FAILED
+                    log.error("release_final_model after final-phase error", exc_info=True)
         else:
             # always leave a partial artifact when full summary is skipped
             try:
@@ -501,9 +557,17 @@ class CourseSession:
                     self.storage.final_summary_path.exists()
                     or (summary_path and str(summary_path).endswith("final_summary.md"))
                 )
+                # Final Fusion failure never counts as full success.
+                if fusion_status == "failure":
+                    success = False
             elif summary_path:
                 # wait_final_summary=False clean stop: partial is enough
                 success = success and Path(summary_path).exists()
+            # FINAL_MODEL unload failure → not STOPPED success (Round 5).
+            if not final_release_ok or final_release_errs:
+                success = False
+                if cleanup_status == CleanupStatus.CLEANUP_OK:
+                    cleanup_status = CleanupStatus.CLEANUP_FAILED
             self.state = SessionState.STOPPED if success else SessionState.FAILED
 
         partial = self.storage.partial_notes_path.exists()
