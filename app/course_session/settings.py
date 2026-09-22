@@ -6,11 +6,14 @@ modules can be imported unmodified (adapter/reuse strategy).
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
 QLENS_DIR = ROOT / "third_party" / "qlens"
@@ -43,6 +46,10 @@ WORKER_JOIN_TIMEOUT = REQUEST_TIMEOUT + CLEANUP_GRACE
 # headroom (default 4096 truncated content -> empty replies). Verified locally.
 NUM_CTX_LIVE = int(_env("NUM_CTX_LIVE", "8192"))
 NUM_CTX_FINAL = int(_env("NUM_CTX_FINAL", "16384"))
+
+# Retry/unload verification tuning
+UNLOAD_RETRY_COUNT = int(_env("UNLOAD_RETRY_COUNT", "3"))
+UNLOAD_RETRY_DELAY_S = float(_env("UNLOAD_RETRY_DELAY_S", "2.0"))
 
 
 def ollama_base_url(ollama_url: str | None = None) -> str:
@@ -78,6 +85,58 @@ def forget_loaded_models(names: set[str] | None = None) -> None:
             _LOADED_MODELS.clear()
         else:
             _LOADED_MODELS.difference_update(names)
+
+
+# --- Ollama /api/ps queries (authoritative liveness check) ---
+def list_loaded_models_via_api() -> set[str]:
+    """Query Ollama /api/ps for models actually resident in VRAM.
+
+    Returns set of model names currently loaded. Empty set on any error
+    (connection refused, timeout, etc.) — callers must treat empty as
+    "unknown / cannot verify" not "nothing loaded".
+    """
+    try:
+        import requests
+
+        base = ollama_base_url()
+        r = requests.get(f"{base}/api/ps", timeout=5)
+        if r.status_code >= 400:
+            log.warning("GET /api/ps returned HTTP %d", r.status_code)
+            return set()
+        data = r.json()
+        models = data.get("models", [])
+        names: set[str] = set()
+        for m in models:
+            if isinstance(m, dict):
+                # Ollama returns "name" or "model" depending on version
+                n = m.get("name") or m.get("model") or ""
+                if n:
+                    names.add(n)
+        return names
+    except Exception as e:
+        log.warning("GET /api/ps failed: %s", e)
+        return set()
+
+
+def is_model_resident(name: str) -> bool | None:
+    """Check if a specific model is resident via /api/ps.
+
+    Returns True/False if verified, None if cannot query /api/ps.
+    """
+    resident = list_loaded_models_via_api()
+    if not resident:
+        return None  # cannot verify
+    # exact match or prefix match (tag handling)
+    for r in resident:
+        if r == name or r.startswith(name + ":") or name.startswith(r + ":"):
+            return True
+    return False
+
+
+# --- Cleanup result enum ---
+class CleanupStatus:
+    CLEANUP_OK = "CLEANUP_OK"
+    CLEANUP_FAILED = "CLEANUP_FAILED"
 
 
 # --- Visual stream ---

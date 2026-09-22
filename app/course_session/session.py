@@ -1,5 +1,8 @@
 """CourseSession: thin orchestrator gluing audio bridge, visual stream,
 note fusion loop and storage. No new capture/inference machinery.
+
+Round 3: unified cleanup core path — stop/fatal/exception all funnel through
+the same stop_workers + release_models + verify_ps sequence.
 """
 
 from __future__ import annotations
@@ -15,7 +18,12 @@ from typing import Callable, List, Optional
 
 from .events import TranscriptEvent, VisualEvent
 from .note_engine import NoteEngine
-from .settings import FUSION_INTERVAL_S, WORKER_JOIN_TIMEOUT, mark_model_loaded
+from .settings import (
+    FUSION_INTERVAL_S,
+    WORKER_JOIN_TIMEOUT,
+    CleanupStatus,
+    mark_model_loaded,
+)
 from .storage import SessionStorage
 from .audio_bridge import AudioBridge
 from .visual import VisualStream
@@ -83,7 +91,23 @@ class CourseSession:
 
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """Start audio + visual + fusion. Blocks until whisper is loaded."""
+        """Start audio + visual + fusion. Blocks until whisper is loaded.
+
+        Round 3: preflight_cleanup() runs BEFORE any workers start to unload
+        leftover FINAL_MODEL from a previous session.
+        """
+        # Preflight: unload leftover FINAL_MODEL before starting realtime
+        from .final_summary import preflight_cleanup
+
+        pf_ok, pf_msg = preflight_cleanup()
+        if not pf_ok:
+            self.last_error = f"preflight cleanup failed: {pf_msg}"
+            self.state = SessionState.FAILED
+            raise RuntimeError(
+                f"Cannot start session: {pf_msg}. "
+                "Previous final model must be unloaded before starting realtime phase."
+            )
+
         self.running = True
         self.state = SessionState.RUNNING
         self.storage.ensure_live_header(
@@ -175,9 +199,10 @@ class CourseSession:
         )
 
     def _on_audio_fatal(self, exc: Exception) -> None:
-        """Audio fatal: mark FAILED, stop workers, NO full 27B summary.
+        """Audio fatal: full cleanup via unified path, NO full 27B summary.
 
-        Partial notes (partial_notes.md) are still written from disk data.
+        Goes through _cleanup_core: stop visual + audio + fusion, release models,
+        verify /api/ps, write partial_notes.md.
         """
         if self._finalizing:
             # stop already in progress; just record the error
@@ -191,7 +216,14 @@ class CourseSession:
 
         def _run() -> None:
             try:
-                result = self.stop(wait_final_summary=False, failed=True)
+                result = self._cleanup_core(
+                    stop_visual=True,
+                    stop_audio=True,
+                    stop_fusion=True,
+                    release_models=True,
+                    wait_final_summary=False,
+                    failed=True,
+                )
                 self._status(
                     f"音频失败后的停止完成: success={result.success} "
                     f"partial={result.partial_available} err={result.error}"

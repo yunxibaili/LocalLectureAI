@@ -78,7 +78,11 @@ class AudioBridge:
         return self._writer_path
 
     def workers_alive(self) -> list[str]:
-        """Names of still-running worker threads (for stop-gate checks)."""
+        """Names of still-running worker threads (for stop-gate checks).
+
+        Only returns names after verifying is_alive() is True. Uses retained
+        references — never cleared until after join confirms death.
+        """
         out: list[str] = []
         if self._recorder is not None and self._recorder.is_alive():
             out.append("recorder")
@@ -170,14 +174,20 @@ class AudioBridge:
         self.last_status = f"recording ({AUDIO_SOURCE}, whisper {device})"
         log.info("AudioBridge started: %s", self.last_status)
 
-    @staticmethod
-    def _rollback_start(recorder, pipeline, engine) -> None:
-        """Best-effort reverse teardown of a partially started stack."""
+    def _rollback_start(self, recorder, pipeline, engine) -> None:
+        """Best-effort reverse teardown of a partially started stack.
+
+        Uses same stop-then-join-then-clear-ref discipline as stop().
+        """
         if recorder is not None:
             try:
                 recorder.stop()
                 if hasattr(recorder, "join"):
                     recorder.join(timeout=5)
+                # keep ref until confirmed dead; if dead, clear
+                if hasattr(recorder, "is_alive") and not recorder.is_alive():
+                    if self._recorder is recorder:
+                        self._recorder = None
             except Exception:
                 log.error("rollback recorder failed", exc_info=True)
         if pipeline is not None:
@@ -185,11 +195,16 @@ class AudioBridge:
                 pipeline.stop()
                 if hasattr(pipeline, "join"):
                     pipeline.join(timeout=15)
+                if hasattr(pipeline, "is_alive") and not pipeline.is_alive():
+                    if self._pipeline is pipeline:
+                        self._pipeline = None
             except Exception:
                 log.error("rollback pipeline failed", exc_info=True)
         if engine is not None:
             try:
                 engine.unload()
+                if self._engine is engine:
+                    self._engine = None
             except Exception:
                 log.error("rollback engine unload failed", exc_info=True)
 
@@ -255,22 +270,28 @@ class AudioBridge:
                 pass
 
     # ------------------------------------------------------------------
-    def stop(self) -> None:
-        """Teardown mirroring HearsayApp._teardown_recording (no UI).
+    def stop(self) -> bool:
+        """Teardown: request stop -> signal -> join -> is_alive verify -> clear refs.
 
-        Idempotent: a second call is a no-op (safe for rollback + session.stop).
+        Hard constraint: references are ONLY cleared after join() confirms
+        is_alive() == False. On timeout, references are KEPT and cleanup is
+        reported as incomplete (returns False).
+
+        Returns True only if all workers confirmed dead.
         """
         with self._stop_lock:
             if self._stopped:
-                return
+                # already stopping/stopped — return current liveness state
+                return not self.workers_alive()
             self._stopped = True
 
         self._recording = False
         self._stop_poll.set()
 
         recorder, pipeline, engine = self._recorder, self._pipeline, self._engine
-        self._recorder = self._pipeline = self._engine = None
+        cleanup_ok = True
 
+        # recorder: stop -> join loop until dead or timeout
         if recorder:
             try:
                 recorder.stop()
@@ -279,20 +300,46 @@ class AudioBridge:
                 while recorder.is_alive() and waited < 60:
                     recorder.join(timeout=5)
                     waited += 5
+                if recorder.is_alive():
+                    log.error("recorder still alive after 60s join")
+                    cleanup_ok = False
+                    # DO NOT clear reference — keep for workers_alive()
+                else:
+                    # confirmed dead — clear reference
+                    if self._recorder is recorder:
+                        self._recorder = None
             except Exception:
                 log.error("recorder stop failed", exc_info=True)
+                cleanup_ok = False
 
+        # pipeline: stop -> join until dead or timeout
         if pipeline:
             try:
                 pipeline.stop()
                 pipeline.join(timeout=60)
+                if pipeline.is_alive():
+                    log.error("pipeline still alive after 60s join")
+                    cleanup_ok = False
+                    # keep reference
+                else:
+                    if self._pipeline is pipeline:
+                        self._pipeline = None
             except Exception:
                 log.error("pipeline stop failed", exc_info=True)
+                cleanup_ok = False
 
-        # drain remaining results before unload
+        # poll thread: signal already set; join
         if self._poll_thread:
             self._poll_thread.join(timeout=3)
+            if self._poll_thread.is_alive():
+                log.error("poll thread still alive after join")
+                cleanup_ok = False
+                # keep reference
+            else:
+                if self._poll_thread is not None:
+                    self._poll_thread = None
 
+        # drain remaining results before unload
         try:
             while True:
                 result = self._transcript_queue.get_nowait()
@@ -310,9 +357,15 @@ class AudioBridge:
         if engine:
             try:
                 engine.unload()
+                # engine unload doesn't have a thread to join; clear after unload
+                if self._engine is engine:
+                    self._engine = None
             except Exception:
                 log.error("engine unload failed", exc_info=True)
+                # keep reference so it's visible
 
         self.last_status = "stopped"
         self._started = False
-        log.info("AudioBridge stopped (%d events)", self.events_emitted)
+        log.info("AudioBridge stopped (%d events, cleanup_ok=%s)",
+                 self.events_emitted, cleanup_ok)
+        return cleanup_ok

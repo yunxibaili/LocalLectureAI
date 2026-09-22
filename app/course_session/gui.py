@@ -10,6 +10,7 @@ import ctypes
 import logging
 import threading
 import traceback
+from pathlib import Path
 
 # DPI awareness BEFORE QApplication (same as QLens main.py)
 try:
@@ -50,14 +51,36 @@ STYLE_STOP = (
 
 
 def format_stop_result(r: StopResult) -> str:
-    """Honest user-facing line for a StopResult (never fake success)."""
-    if r.success and r.summary_path and r.summary_path.endswith("final_summary.md"):
+    """Honest user-facing line for a StopResult (never fake success).
+
+    final_summary success requires: r.success AND summary_path endswith
+    final_summary.md AND file exists AND size > 0.
+    """
+    def _final_summary_valid(path: str | None) -> bool:
+        if not path or not path.endswith("final_summary.md"):
+            return False
+        try:
+            p = Path(path)
+            return p.exists() and p.stat().st_size > 0
+        except Exception:
+            return False
+
+    if r.success and _final_summary_valid(r.summary_path):
         base = f"课程已结束，final_summary.md 已生成：{r.summary_path}"
         if r.partial_available:
             base += "（另有 partial_notes.md）"
         return base
     if r.success and r.partial_available and r.summary_path:
         return f"课程已结束（部分笔记）：{r.summary_path}"
+    # Check for cleanup failure specifically
+    if r.error and ("cleanup" in r.error.lower() or "resident" in r.error.lower()
+                    or "CLEANUP_FAILED" in r.error):
+        base = "实时资源未完全清理，未生成最终总结"
+        if r.error:
+            base += f" — {r.error}"
+        if r.partial_available and r.summary_path:
+            base += f" | 部分笔记可用: {r.summary_path}"
+        return base
     parts = [f"课程结束状态: {r.state}"]
     if r.error:
         parts.append(f"错误: {r.error}")

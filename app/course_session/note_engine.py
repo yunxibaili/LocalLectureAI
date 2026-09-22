@@ -71,7 +71,12 @@ class NoteEngine:
         transcripts: List[TranscriptEvent],
         visuals: List[VisualEvent],
     ) -> bool:
-        """Run one fusion step. Returns True if state was updated."""
+        """Run one fusion step. Returns True if state was updated.
+
+        mark_model_loaded is ONLY called after a successful chat_text call
+        that returned parseable content (including skip=True responses).
+        Not called on exception or invalid/empty response.
+        """
         from core.ollama_client import chat_text  # reuse QLens client
 
         tr_lines = [
@@ -88,6 +93,7 @@ class NoteEngine:
 
         user = build_fusion_prompt(self.state.to_dict(), tr_lines, vi_lines)
         raw = ""
+        model_loaded_ok = False
         try:
             for attempt in range(2):
                 raw = chat_text(
@@ -95,7 +101,8 @@ class NoteEngine:
                     num_predict=6144, num_ctx=NUM_CTX_LIVE,
                 )
                 if raw:
-                    mark_model_loaded(self.model)
+                    # mark only after successful call (chat_text returned content)
+                    model_loaded_ok = True
                 if _parse_json_loose(raw) is not None:
                     break
                 log.warning("fusion attempt %d not JSON; retrying", attempt + 1)
@@ -107,10 +114,18 @@ class NoteEngine:
         delta = _parse_json_loose(raw)
         if delta is None:
             log.warning("fusion response not JSON (ignored): %s", (raw or "")[:200])
+            # Do NOT mark_model_loaded on invalid response — model may not have loaded
             return False
         if delta.get("skip") is True:
             log.info("fusion skip (no valuable new info)")
+            # skip is a valid response — model did load
+            if model_loaded_ok:
+                mark_model_loaded(self.model)
             return False
+
+        # Valid delta — model loaded successfully
+        if model_loaded_ok:
+            mark_model_loaded(self.model)
 
         self._apply_delta(delta)
         self.state.recent_transcript = "\n".join(tr_lines[-10:])
