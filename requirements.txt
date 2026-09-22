@@ -1,0 +1,3 @@
+# Course assistant runtime (merges both upstream requirement sets)
+-r third_party/qlens/requirements.txt
+-r third_party/Hearsay/requirements.txt

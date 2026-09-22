@@ -1,0 +1,16 @@
+.claude
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+# ...except the canonical build definition used by build.bat
+!Hearsay.spec
+# Scratch incident write-ups at the repo root are local working notes.
+# (Root-anchored on purpose: GitHub issue templates or docs elsewhere,
+# e.g. .github/, are not affected.)
+/ISSUE_*.md
+installer_output/
+*.egg-info/
+.env
