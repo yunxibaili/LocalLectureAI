@@ -132,17 +132,17 @@ qwen38-27b → OOM。
 ## P2-7 文档诚实化
 
 **原因**：`docs/qlens.patch` 为 UTF-16LE（工具无法当文本读）；vendored 无嵌套 git 时
-“权威 git diff”表述过强；行数/“900 行”类未核实表述；e2e 易被误读为自建 fixture。
+“权威 git diff”表述过强；行数类未核实表述（如把未实测的应用层行数当权威）；e2e 易被误读为自建 fixture。
 
 **修改文件**：
 - `docs/qlens.patch`：重写为 **UTF-8**（config.py + ollama_client.py 记录用 diff）。
 - `docs/hearsay.patch`：UTF-8 头注释说明「空 = 零修改的记录，非唯一可复现证据」。
 - `docs/IMPLEMENTATION.md`：区分「记录用 patch」vs「可核对修改说明」；补基线 SHA；
-  应用层行数改为实测统计口径；写明稳定性约束；**删除/避免“900 行”**；E2E 非自建 fixture。
+  应用层行数改为实测统计口径；写明稳定性约束；**删除/避免未实测行数**；E2E 非自建 fixture。
 - `docs/REUSE_MAP.md`：`ollama_client` 修改量改为与 patch 一致的诚实描述。
 - `docs/TEST_REPORT.md`：缺陷记录追加稳定性轮；复跑清单加 `test_stability.py` 与 Hearsay tests。
 
-**测试证据**：`test_stability.py` — `qlens.patch` UTF-8 decode PASS、无 “900 行”。
+**测试证据**：`test_stability.py` — `qlens.patch` UTF-8 decode PASS、无未实测行数断言。
 
 ---
 

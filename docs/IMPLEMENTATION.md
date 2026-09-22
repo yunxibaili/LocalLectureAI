@@ -116,7 +116,7 @@ Whisper 模型落盘在 `%APPDATA%\Hearsay\models`（运行时数据，非源码
 ### 4) 本应用层（非上游）
 
 应用层 `app/course_session/` 新增代码量以 `Get-ChildItem app/course_session/*.py`
-统计行数为准（约 1600+ 行，随稳定性修复变动；**不引用“900 行”等未核实数字**）。
+统计行数为准（约 1600+ 行，随稳定性修复变动；**不引用任何未经实测的行数数字**）。
 E2E 使用桌面 SlideDeck + TTS 产生真实屏幕/音频输入，**不是**自建 fixture 单测。
 
 `app/course_session/settings.py`：
