@@ -85,11 +85,11 @@ WASAPI Loopback (pyaudiowpatch, callback)
 | 位置 | 修改 | 原因 | 行数量级 |
 |---|---|---|---|
 | `qlens/config.py` | `MODEL_NAME` 默认值改为可被环境变量覆盖（`VISION_MODEL`），新增 `FALLBACK_VISION_MODEL` | 第一版视觉模型指定 `qwen3-vl:8b`，且模型名必须可配置 | ~5 行 |
-| `qlens/core/ollama_client.py` | 无需改（`chat()` 已有 `model=` 参数；`chat_text()` 需加可选 `model=` 参数） | `chat_text` 硬编码 `TEXT_MODEL_NAME`，课后总结要换 `qwen38-27b-main` | ~3 行 |
+| `qlens/core/ollama_client.py` | `chat()`/`chat_text()` 增加可选 `think`/`num_predict`/`num_ctx`/`model`/`keep_alive`（默认 `None` 不改变上游行为） | 课后总结要换 `qwen38-27b` 并关思考；实时要加大 ctx | 约数十行可选参数（见 `docs/qlens.patch`） |
 | Hearsay 配置（`%APPDATA%\Hearsay\config.json`，非源码） | `language=zh`、`model_name=turbo`（多语言）、`device=cuda`、`audio_source=system` | 中文普通话优先；`.en` 模型不支持中文 | 0 行源码（配置数据） |
 | 无其他上游源码修改 | — | 其余全部通过 import / adapter / wrapper 完成 | — |
 
-upstream diff 汇总见 `docs/IMPLEMENTATION.md`。
+upstream diff 汇总见 `docs/IMPLEMENTATION.md`（含“记录用 patch vs 可核对修改”的区分说明）。
 
 ## 5. 绝对不应重写的能力
 

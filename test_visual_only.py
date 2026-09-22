@@ -9,6 +9,7 @@ from app.course_session.visual import VisualStream  # noqa: E402
 from core.capture import Region  # noqa: E402
 
 events = []
+errors = []
 
 
 def on_vis(e):
@@ -25,9 +26,25 @@ vs.stop()
 vs.join(timeout=90)
 print(
     f"frames={vs.frame_id} vlm_calls={vs.vlm_calls} skipped={vs.skipped_frames} "
-    f"err={vs.last_error!r} status={vs.last_status!r}",
+    f"failed={vs.failed_analyses} err={vs.last_error!r} status={vs.last_status!r} "
+    f"alive={vs.is_alive()}",
     flush=True,
 )
 print("events:", len(events))
 for e in events:
     print(f"  f={e.frame_id} diff={e.diff_score} len={len(e.description)}")
+
+# P2-6: must exit non-zero on failure (never silent success)
+checks = {
+    "thread_stopped": not vs.is_alive(),
+    "frames_advanced": vs.frame_id >= 5,
+    "got_at_least_one_event": len(events) >= 1,
+    "event_description_nonempty": all((e.description or "").strip() for e in events) if events else False,
+    "no_hard_error": vs.last_error == "" or "VLM" not in vs.last_error,
+}
+print("=" * 60, flush=True)
+for k, v in checks.items():
+    print(f"  {'OK ' if v else 'FAIL'} {k}", flush=True)
+overall = all(checks.values())
+print(f"VISUAL_ONLY_TEST {'PASS' if overall else 'FAIL'}", flush=True)
+sys.exit(0 if overall else 1)

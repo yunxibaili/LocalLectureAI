@@ -10,7 +10,13 @@ from typing import List, Optional
 
 from .events import CourseState, TranscriptEvent, VisualEvent
 from .prompts import FUSION_SYSTEM, build_fusion_prompt
-from .settings import FUSION_MODEL, NUM_CTX_LIVE, RECENT_TRANSCRIPT_EVENTS, RECENT_VISUAL_EVENTS
+from .settings import (
+    FUSION_MODEL,
+    NUM_CTX_LIVE,
+    RECENT_TRANSCRIPT_EVENTS,
+    RECENT_VISUAL_EVENTS,
+    mark_model_loaded,
+)
 from .storage import SessionStorage, fmt_t
 
 log = logging.getLogger(__name__)
@@ -88,6 +94,8 @@ class NoteEngine:
                     FUSION_SYSTEM, user, temperature=0.2, model=self.model,
                     num_predict=6144, num_ctx=NUM_CTX_LIVE,
                 )
+                if raw:
+                    mark_model_loaded(self.model)
                 if _parse_json_loose(raw) is not None:
                     break
                 log.warning("fusion attempt %d not JSON; retrying", attempt + 1)

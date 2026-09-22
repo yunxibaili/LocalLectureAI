@@ -64,6 +64,9 @@ class AudioBridge:
         self._poll_thread: Optional[threading.Thread] = None
         self._stop_poll = threading.Event()
         self._recording = False
+        self._started = False
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
         self.last_error: str = ""
         self.last_status: str = "idle"
@@ -74,9 +77,24 @@ class AudioBridge:
     def writer_path(self) -> Path:
         return self._writer_path
 
+    def workers_alive(self) -> list[str]:
+        """Names of still-running worker threads (for stop-gate checks)."""
+        out: list[str] = []
+        if self._recorder is not None and self._recorder.is_alive():
+            out.append("recorder")
+        if self._pipeline is not None and self._pipeline.is_alive():
+            out.append("pipeline")
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            out.append("poll")
+        return out
+
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """Load whisper, start pipeline + recorder + poller (blocking until ready)."""
+        """Load whisper, start pipeline + recorder + poller (blocking until ready).
+
+        On any failure after a partial start, tears down in reverse order
+        (recorder -> pipeline -> engine) so no half-started workers leak.
+        """
         from hearsay.audio.recorder import AudioRecorder              # reuse
         from hearsay.transcription.engine import TranscriptionEngine  # reuse
         from hearsay.transcription.pipeline import TranscriptionPipeline  # reuse
@@ -118,22 +136,32 @@ class AudioBridge:
             engine.load()
 
         self._engine = engine
-        self._pipeline = TranscriptionPipeline(
-            audio_queue=self._audio_queue,
-            transcript_queue=self._transcript_queue,
-            engine=engine,
-        )
-        self._pipeline.start()
+        pipeline = None
+        recorder = None
+        try:
+            pipeline = TranscriptionPipeline(
+                audio_queue=self._audio_queue,
+                transcript_queue=self._transcript_queue,
+                engine=engine,
+            )
+            pipeline.start()
+            self._pipeline = pipeline
 
-        self._recorder = AudioRecorder(
-            audio_queue=self._audio_queue,
-            source=AUDIO_SOURCE,
-            on_fatal=self._handle_fatal,
-            on_no_audio=self._handle_no_audio,
-        )
-        self._recorder.start()
+            recorder = AudioRecorder(
+                audio_queue=self._audio_queue,
+                source=AUDIO_SOURCE,
+                on_fatal=self._handle_fatal,
+                on_no_audio=self._handle_no_audio,
+            )
+            recorder.start()
+            self._recorder = recorder
+        except Exception:
+            # reverse-order rollback: recorder -> pipeline -> engine
+            self._rollback_start(recorder, pipeline, engine)
+            raise
 
         self._recording = True
+        self._started = True
         self._stop_poll.clear()
         self._poll_thread = threading.Thread(
             target=self._poll_loop, name="TranscriptPoll", daemon=True
@@ -141,6 +169,29 @@ class AudioBridge:
         self._poll_thread.start()
         self.last_status = f"recording ({AUDIO_SOURCE}, whisper {device})"
         log.info("AudioBridge started: %s", self.last_status)
+
+    @staticmethod
+    def _rollback_start(recorder, pipeline, engine) -> None:
+        """Best-effort reverse teardown of a partially started stack."""
+        if recorder is not None:
+            try:
+                recorder.stop()
+                if hasattr(recorder, "join"):
+                    recorder.join(timeout=5)
+            except Exception:
+                log.error("rollback recorder failed", exc_info=True)
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+                if hasattr(pipeline, "join"):
+                    pipeline.join(timeout=15)
+            except Exception:
+                log.error("rollback pipeline failed", exc_info=True)
+        if engine is not None:
+            try:
+                engine.unload()
+            except Exception:
+                log.error("rollback engine unload failed", exc_info=True)
 
     # ------------------------------------------------------------------
     def _poll_loop(self) -> None:
@@ -205,7 +256,15 @@ class AudioBridge:
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
-        """Teardown mirroring HearsayApp._teardown_recording (no UI)."""
+        """Teardown mirroring HearsayApp._teardown_recording (no UI).
+
+        Idempotent: a second call is a no-op (safe for rollback + session.stop).
+        """
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
         self._recording = False
         self._stop_poll.set()
 
@@ -213,16 +272,22 @@ class AudioBridge:
         self._recorder = self._pipeline = self._engine = None
 
         if recorder:
-            recorder.stop()
-            recorder.join(timeout=5)
-            waited = 5
-            while recorder.is_alive() and waited < 60:
+            try:
+                recorder.stop()
                 recorder.join(timeout=5)
-                waited += 5
+                waited = 5
+                while recorder.is_alive() and waited < 60:
+                    recorder.join(timeout=5)
+                    waited += 5
+            except Exception:
+                log.error("recorder stop failed", exc_info=True)
 
         if pipeline:
-            pipeline.stop()
-            pipeline.join(timeout=60)
+            try:
+                pipeline.stop()
+                pipeline.join(timeout=60)
+            except Exception:
+                log.error("pipeline stop failed", exc_info=True)
 
         # drain remaining results before unload
         if self._poll_thread:
@@ -249,4 +314,5 @@ class AudioBridge:
                 log.error("engine unload failed", exc_info=True)
 
         self.last_status = "stopped"
+        self._started = False
         log.info("AudioBridge stopped (%d events)", self.events_emitted)

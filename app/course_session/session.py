@@ -8,11 +8,14 @@ import logging
 import threading
 import time
 import traceback
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from .events import TranscriptEvent, VisualEvent
 from .note_engine import NoteEngine
-from .settings import FUSION_INTERVAL_S
+from .settings import FUSION_INTERVAL_S, WORKER_JOIN_TIMEOUT, mark_model_loaded
 from .storage import SessionStorage
 from .audio_bridge import AudioBridge
 from .visual import VisualStream
@@ -21,6 +24,27 @@ from .visual import VisualStream
 from core.capture import Region  # noqa: E402 (upstream reuse)
 
 log = logging.getLogger(__name__)
+
+
+class SessionState(str, Enum):
+    IDLE = "idle"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+@dataclass
+class StopResult:
+    """Honest stop outcome for GUI / scripts (never claims success on failure)."""
+
+    success: bool
+    state: str
+    summary_path: Optional[str] = None
+    error: Optional[str] = None
+    partial_available: bool = False
+    workers_stopped: bool = True
+    lingering_workers: Optional[list] = None
 
 
 class CourseSession:
@@ -49,6 +73,9 @@ class CourseSession:
         self._flag_thread: Optional[threading.Thread] = None
         self._finalizing = False
         self.running = False
+        self.state = SessionState.IDLE
+        self._stop_result: Optional[StopResult] = None
+        self._audio_failed = False
 
         self.audio: Optional[AudioBridge] = None
         self.visual: Optional[VisualStream] = None
@@ -58,29 +85,56 @@ class CourseSession:
     def start(self) -> None:
         """Start audio + visual + fusion. Blocks until whisper is loaded."""
         self.running = True
+        self.state = SessionState.RUNNING
         self.storage.ensure_live_header(
             f"课程笔记 — {time.strftime('%Y-%m-%d %H:%M')}"
         )
+        self.storage.write_active_marker()
 
         # Audio (Hearsay assembly). Blocking (model load).
-        self.audio = AudioBridge(
-            on_event=self._on_transcript,
-            transcript_dir=self.storage.dir,
-            t0=self._t0,
-            on_fatal=self._on_audio_fatal,
-        )
-        self._status("启动音频与 Whisper…")
-        self.audio.start()
-        self.storage.set_transcript_writer_path(self.audio.writer_path)
+        try:
+            self.audio = AudioBridge(
+                on_event=self._on_transcript,
+                transcript_dir=self.storage.dir,
+                t0=self._t0,
+                on_fatal=self._on_audio_fatal,
+            )
+            self._status("启动音频与 Whisper…")
+            self.audio.start()
+            self.storage.set_transcript_writer_path(self.audio.writer_path)
+        except Exception as e:
+            # reverse partial start of visual not yet begun; audio rolls back itself
+            self.last_error = f"audio start failed: {e}"
+            self.running = False
+            self.state = SessionState.FAILED
+            self.storage.clear_active_marker()
+            try:
+                if self.audio:
+                    self.audio.stop()
+            except Exception:
+                pass
+            raise
 
         # Visual (QLens capture + VLM). Non-blocking thread.
-        self.visual = VisualStream(
-            region=self.region,
-            on_event=self._on_visual,
-            t0=self._t0,
-        )
-        self._status("启动视觉流…")
-        self.visual.start()
+        try:
+            self.visual = VisualStream(
+                region=self.region,
+                on_event=self._on_visual,
+                t0=self._t0,
+            )
+            self._status("启动视觉流…")
+            self.visual.start()
+        except Exception as e:
+            self.last_error = f"visual start failed: {e}"
+            self.running = False
+            self.state = SessionState.FAILED
+            try:
+                if self.audio:
+                    self.audio.stop()
+            except Exception:
+                pass
+            self.storage.clear_active_marker()
+            raise
 
         self._stop_fusion.clear()
         self._fusion_thread = threading.Thread(
@@ -121,8 +175,31 @@ class CourseSession:
         )
 
     def _on_audio_fatal(self, exc: Exception) -> None:
+        """Audio fatal: mark FAILED, stop workers, NO full 27B summary.
+
+        Partial notes (partial_notes.md) are still written from disk data.
+        """
+        if self._finalizing:
+            # stop already in progress; just record the error
+            if not self.last_error:
+                self.last_error = f"audio fatal: {exc}"
+            return
         self.last_error = f"audio fatal: {exc}"
-        self._status(f"音频致命错误: {exc}")
+        self._audio_failed = True
+        self.state = SessionState.FAILED
+        self._status(f"音频致命错误: {exc} — 将停止会话并写入 partial_notes")
+
+        def _run() -> None:
+            try:
+                result = self.stop(wait_final_summary=False, failed=True)
+                self._status(
+                    f"音频失败后的停止完成: success={result.success} "
+                    f"partial={result.partial_available} err={result.error}"
+                )
+            except Exception:
+                log.error("stop after audio fatal failed\n%s", traceback.format_exc())
+
+        threading.Thread(target=_run, daemon=True, name="AudioFatalStop").start()
 
     def _flag_loop(self) -> None:
         """Watch sessions/<this>/STOP_REQUEST written by stop_course.ps1."""
@@ -156,6 +233,7 @@ class CourseSession:
             self._unfused_visuals.clear()
 
         updated = self.note_engine.fuse(tr, vi)
+        mark_model_loaded(self.note_engine.model)
         st = self.note_engine.state
         self._status(
             f"增量笔记 #{st.updates}: 主题={st.current_topic or '-'} "
@@ -165,23 +243,58 @@ class CourseSession:
         )
 
     # ------------------------------------------------------------------
-    def stop(self, wait_final_summary: bool = True) -> None:
-        """Stop streams, then (optionally) generate final summary."""
+    def _lingering_workers(self) -> list[str]:
+        out: list[str] = []
+        if self.visual is not None and self.visual.is_alive():
+            out.append("visual")
+        if self._fusion_thread is not None and self._fusion_thread.is_alive():
+            out.append("fusion")
+        if self.audio is not None:
+            out.extend(f"audio:{n}" for n in self.audio.workers_alive())
+        return out
+
+    def stop(
+        self,
+        wait_final_summary: bool = True,
+        failed: bool = False,
+    ) -> StopResult:
+        """Stop streams, then (optionally) generate final summary.
+
+        Returns StopResult — success only if workers stopped AND (when
+        requested AND not failed) final_summary.md was written.
+        Never loads FINAL_MODEL while a worker is still alive (VRAM gate).
+        """
+        if self._finalizing and self._stop_result is not None:
+            return self._stop_result
         if self._finalizing:
-            return
+            # concurrent stop: wait briefly for the other to publish a result
+            deadline = time.monotonic() + WORKER_JOIN_TIMEOUT
+            while self._stop_result is None and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if self._stop_result is not None:
+                return self._stop_result
+
         self._finalizing = True
+        self.state = SessionState.STOPPING
+        summary_path: Optional[str] = None
+        stop_error: Optional[str] = None
+
         self._status("正在停止视觉流…")
         if self.visual:
             self.visual.stop()
-            self.visual.join(timeout=30)
+            self.visual.join(timeout=WORKER_JOIN_TIMEOUT)
 
         self._status("正在停止音频与 Whisper…")
         if self.audio:
-            self.audio.stop()
+            try:
+                self.audio.stop()
+            except Exception as e:
+                stop_error = f"audio stop failed: {e}"
+                log.error("audio stop failed", exc_info=True)
 
         self._stop_fusion.set()
         if self._fusion_thread:
-            self._fusion_thread.join(timeout=FUSION_INTERVAL_S + 60)
+            self._fusion_thread.join(timeout=WORKER_JOIN_TIMEOUT)
 
         # final fusion for any leftovers
         try:
@@ -192,18 +305,93 @@ class CourseSession:
         self.storage.finalize_transcript()
         self.running = False
 
+        # VRAM / correctness gate: no 27B load while workers still alive.
+        lingering = self._lingering_workers()
+        workers_ok = not lingering
+        if not workers_ok:
+            msg = (
+                f"workers still alive after join timeout={WORKER_JOIN_TIMEOUT}s: "
+                f"{lingering}; refuse to load {self._note_final_model()}"
+            )
+            log.error(msg)
+            stop_error = (stop_error + "; " if stop_error else "") + msg
+            wait_final_summary = False
+
+        # Audio-fatal path: no full summary, but always write partial notes.
+        if failed or self._audio_failed or (self.last_error or "").startswith("audio fatal"):
+            wait_final_summary = False
+
         if wait_final_summary:
             from .final_summary import generate_final_summary
 
             self._status("正在生成课后总结（qwen38-27b 独占加载）…")
             try:
-                path = generate_final_summary(self.storage, self._status)
-                self._status(f"完成: {path}")
+                summary_path = generate_final_summary(self.storage, self._status)
+                self._status(f"完成: {summary_path}")
             except Exception as e:
-                self.last_error = f"final summary failed: {e}"
+                stop_error = f"final summary failed: {e}"
+                self.last_error = stop_error
                 log.error("final summary failed\n%s", traceback.format_exc())
                 self._status(f"课后总结失败: {e}")
-        self._status("课程会话已结束")
+        else:
+            # always leave a partial artifact when full summary is skipped
+            try:
+                p = self.storage.write_partial_notes(
+                    reason=stop_error or self.last_error or "full summary skipped"
+                )
+                summary_path = str(p)
+                self._status(f"partial_notes.md 已写入: {p}")
+            except Exception as e:
+                log.error("partial notes write failed", exc_info=True)
+
+        self.storage.clear_active_marker()
+
+        if failed or self._audio_failed:
+            self.state = SessionState.FAILED
+            # Failure path "succeeds" only if workers stopped AND partial
+            # notes exist; success still means StopResult.success for GUI.
+            # We keep success=False for the user when audio fatal (session failed),
+            # but partial_available tells them notes exist.
+            success = False
+        else:
+            success = workers_ok and stop_error is None
+            if wait_final_summary:
+                success = success and summary_path is not None and (
+                    self.storage.final_summary_path.exists()
+                    or (summary_path and str(summary_path).endswith("final_summary.md"))
+                )
+            elif summary_path:
+                # wait_final_summary=False clean stop: partial is enough
+                success = success and Path(summary_path).exists()
+            self.state = SessionState.STOPPED if success else SessionState.FAILED
+
+        partial = self.storage.partial_notes_path.exists()
+        # For the audio-fatal "failure path completed cleanly" case, surface
+        # the original audio error rather than a generic None.
+        err_out = stop_error
+        if err_out is None and not success:
+            err_out = self.last_error or None
+        if err_out is None and (failed or self._audio_failed):
+            err_out = self.last_error or "audio failed"
+        self._stop_result = StopResult(
+            success=success,
+            state=self.state.value,
+            summary_path=summary_path,
+            error=err_out,
+            partial_available=partial,
+            workers_stopped=workers_ok,
+            lingering_workers=lingering or None,
+        )
+        self._status(
+            f"课程会话已结束 state={self._stop_result.state} "
+            f"success={self._stop_result.success}"
+        )
+        return self._stop_result
+
+    def _note_final_model(self) -> str:
+        from .settings import FINAL_MODEL
+
+        return FINAL_MODEL
 
     # ------------------------------------------------------------------
     def snapshot(self) -> dict:
@@ -211,13 +399,16 @@ class CourseSession:
         return {
             "session": self.storage.dir.name,
             "running": self.running,
+            "state": self.state.value,
             "transcripts": len(self._transcripts),
             "visual_events": len(self._visuals),
             "vlm_calls": self.visual.vlm_calls if self.visual else 0,
             "vlm_skipped": self.visual.skipped_frames if self.visual else 0,
+            "vlm_failed": self.visual.failed_analyses if self.visual else 0,
             "topic": st.current_topic,
             "updates": st.updates,
             "audio": self.audio.last_status if self.audio else "",
             "visual": self.visual.last_status if self.visual else "",
             "error": self.last_error or (self.visual.last_error if self.visual else ""),
+            "workers_alive": self._lingering_workers(),
         }

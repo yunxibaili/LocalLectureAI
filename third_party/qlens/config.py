@@ -5,7 +5,9 @@ MODEL_NAME = os.environ.get("VISION_MODEL", "qwen2.5vl:7b")
 TEXT_MODEL_NAME = os.environ.get("TEXT_MODEL_NAME", "qwen2.5:7b")  # for video-frame aggregation (text-only)
 FALLBACK_VISION_MODEL = os.environ.get("FALLBACK_VISION_MODEL", "qwen3-vl:4b")
 INFER_SIZE = 1024
-REQUEST_TIMEOUT = 120
+# Aligned with app/course_session/settings.py REQUEST_TIMEOUT (env-overridable)
+# so worker join timeouts derived from REQUEST_TIMEOUT cover both layers.
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
 OVERLAY_AUTO_CLOSE_MS = 30_000
 HOTKEY = "ctrl+shift+a"
 

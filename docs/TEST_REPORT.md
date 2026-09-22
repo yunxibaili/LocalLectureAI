@@ -61,6 +61,9 @@
 4. STOP 测试过早断言：`stop()` 在 summary 完成前就置 `running=False`，测试改为轮询 `final_summary.md`。
 5. 融合偶发空响应：`fuse()` 增加一次重试。
 6. `start_course.ps1` 拼写 `WHISHER_DEVICE` → `WHISPER_DEVICE`。
+7. 稳定性审计修复（详见 `docs/STABILITY_FIX_REPORT.md`）：模型释放硬编码、worker join 超时、
+   视觉 JSON schema 校验、会话目录/STOP_REQUEST 竞态、音频启动回滚、音频 fatal 状态机、
+   GUI StopResult 诚实展示、测试断言与文档诚实化。
 
 ## 限制 / 未覆盖
 
@@ -68,18 +71,22 @@
 - Whisper 数学同音误转存在；已靠视觉公式交叉纠正，未测专用领域词表。
 - GUI 仅冒烟（启动/存活），未做区域选择等交互自动化；真实上课需人工选屏。
 - 并发 pull 曾停滞：现串行脚本验证通过，未再复现排查根因。
-- 未跑 Hearsay 自带 `tests/test_pipeline_writer.py`（源码零修改，非本次改动范围）。
+- Hearsay 自带 `tests/test_pipeline_writer.py`：源码零修改；稳定性回归轮应跑（stub、无硬件）。
+- `test_e2e.py` / `test_visual_only.py` 依赖真实屏幕 SlideDeck、TTS 与 Ollama 模型，不是自建 fixture。
 
 ## 如何复跑
 
 ```powershell
 $env:HF_ENDPOINT='https://hf-mirror.com'
+.venv\Scripts\python.exe test_stability.py     # 稳定性单测（无 GPU）
 .venv\Scripts\python.exe test_loopback.py      # 音频
-.venv\Scripts\python.exe test_visual_only.py   # 门控
+.venv\Scripts\python.exe test_visual_only.py   # 门控（失败 exit 1）
 .venv\Scripts\python.exe test_fusion_visual.py # 融合
-.venv\Scripts\python.exe test_e2e.py           # 端到端（~10min）
+.venv\Scripts\python.exe test_e2e.py           # 端到端（~10min，含内容断言）
 .venv\Scripts\python.exe test_stop_flag.py     # STOP_REQUEST（~5min）
 .venv\Scripts\python.exe vram_bench.py         # VRAM
 # 真实启动
 .\start_course.ps1   # GUI；结束用 GUI 按钮或 .\stop_course.ps1
 ```
+
+回归还应包含：`third_party/Hearsay/tests/test_pipeline_writer.py`（stub，无硬件）。

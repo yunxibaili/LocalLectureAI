@@ -7,26 +7,55 @@ import time
 from typing import Callable, Optional
 
 from .prompts import FINAL_SUMMARY_SYSTEM, build_final_summary_prompt
-from .settings import FINAL_MODEL, NUM_CTX_FINAL, REQUEST_TIMEOUT
+from .settings import (
+    FINAL_MODEL,
+    NUM_CTX_FINAL,
+    REQUEST_TIMEOUT,
+    forget_loaded_models,
+    loaded_models,
+    mark_model_loaded,
+    ollama_base_url,
+)
 from .storage import SessionStorage
 
 log = logging.getLogger(__name__)
 
 
-def _release_vision_model() -> None:
-    """Best-effort: evict the VLM so qwen38 can load exclusively."""
+def _release_tracked_models(exclude: set[str] | None = None) -> list[str]:
+    """Best-effort evict every model THIS process marked as loaded.
+
+    Never hardcodes model names; never overwrites a pending original error —
+    failures are returned as strings for logging only.
+    """
     import requests
 
+    exclude = exclude or set()
+    targets = sorted(loaded_models() - exclude)
+    if not targets:
+        return []
+
+    errors: list[str] = []
     try:
-        from .settings import OLLAMA_URL
-        base = OLLAMA_URL.replace("/api/chat", "")
-        requests.post(
-            f"{base}/api/generate",
-            json={"model": "qwen3-vl:8b", "keep_alive": 0},
-            timeout=10,
-        )
-    except Exception:
-        log.debug("vision model release skipped", exc_info=True)
+        base = ollama_base_url()  # scheme://host — no path string-replace
+    except Exception as e:
+        errors.append(f"base_url: {e}")
+        return errors
+
+    for name in targets:
+        try:
+            r = requests.post(
+                f"{base}/api/generate",
+                json={"model": name, "keep_alive": 0},
+                timeout=10,
+            )
+            if r.status_code >= 400:
+                errors.append(f"{name}: HTTP {r.status_code}")
+            else:
+                log.info("released model %s", name)
+                forget_loaded_models({name})
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    return errors
 
 
 def generate_final_summary(
@@ -42,7 +71,11 @@ def generate_final_summary(
                 pass
 
     _st("释放实时视觉模型…")
-    _release_vision_model()
+    release_errs = _release_tracked_models(exclude={FINAL_MODEL})
+    if release_errs:
+        # do not raise / do not replace a later summary error
+        log.warning("model release incomplete (non-fatal): %s", "; ".join(release_errs))
+        _st(f"模型释放警告: {'; '.join(release_errs)}（继续尝试总结）")
     time.sleep(1.0)
 
     transcript_md = storage.read_text_safe(storage.transcript_path)
@@ -81,6 +114,7 @@ def generate_final_summary(
         think=False,  # verified on qwen38-27b: disables thinking, ~1.5x faster
     )
     summary = (summary or "").strip() or "（模型返回为空）"
+    mark_model_loaded(FINAL_MODEL)
 
     header = f"<!-- generated {time.strftime('%Y-%m-%d %H:%M:%S')} by {FINAL_MODEL} -->\n\n"
     storage.final_summary_path.write_text(header + summary + "\n", encoding="utf-8")

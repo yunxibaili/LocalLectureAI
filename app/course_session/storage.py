@@ -9,13 +9,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from .settings import SESSIONS_DIR
+from .settings import ACTIVE_SESSION_MARKER, SESSIONS_DIR
 
 
 class SessionStorage:
     def __init__(self, session_dir: Path | None = None) -> None:
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        self.dir = Path(session_dir) if session_dir else SESSIONS_DIR / ts
+        if session_dir is not None:
+            self.dir = Path(session_dir)
+        else:
+            # Second precision + monotonic suffix: two sessions started in the
+            # same minute must never share a directory (STOP_REQUEST isolation).
+            base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.dir = SESSIONS_DIR / base
+            n = 1
+            while self.dir.exists():
+                self.dir = SESSIONS_DIR / f"{base}_{n}"
+                n += 1
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -25,8 +34,47 @@ class SessionStorage:
         self.live_notes_path = self.dir / "live_notes.md"
         self.transcript_path = self.dir / "transcript.md"          # final name
         self.final_summary_path = self.dir / "final_summary.md"
+        self.partial_notes_path = self.dir / "partial_notes.md"
         self._transcript_writer_path: Path | None = None           # Hearsay-named file
         self._live_initialized = False
+        self._active_marker_written = False
+
+    # ---------- active session marker (sessions/current_session.json) ----------
+    def write_active_marker(self) -> None:
+        """Point stop_course.ps1 / external tools at THIS session dir."""
+        payload = {
+            "session_dir": self.dir.name,
+            "session_path": str(self.dir),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "pid": None,
+        }
+        try:
+            import os
+
+            payload["pid"] = os.getpid()
+        except Exception:
+            pass
+        try:
+            ACTIVE_SESSION_MARKER.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._active_marker_written = True
+        except Exception:
+            pass
+
+    def clear_active_marker(self) -> None:
+        if not self._active_marker_written:
+            return
+        try:
+            if ACTIVE_SESSION_MARKER.exists():
+                data = json.loads(ACTIVE_SESSION_MARKER.read_text(encoding="utf-8"))
+                # only clear if it still points at us
+                if data.get("session_dir") == self.dir.name:
+                    ACTIVE_SESSION_MARKER.unlink()
+        except Exception:
+            pass
+        self._active_marker_written = False
 
     # ---------- jsonl ----------
     def _append_jsonl(self, path: Path, obj: Any) -> None:
@@ -76,6 +124,40 @@ class SessionStorage:
             except Exception:
                 return p
         return self.transcript_path if self.transcript_path.exists() else p
+
+    # ---------- partial notes (failure path; no full 27B summary) ----------
+    def write_partial_notes(self, reason: str = "") -> Path:
+        """Write partial_notes.md from whatever already exists (no model call)."""
+        parts: list[str] = []
+        header = (
+            f"# 部分课程笔记（未生成完整课后总结）\n\n"
+            f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        if reason:
+            header += f"原因: {reason}\n"
+        parts.append(header)
+
+        live = self.read_text_safe(self.live_notes_path)
+        if live.strip():
+            parts.append("## 实时笔记 live_notes.md\n\n" + live)
+        tr = self.read_text_safe(self.transcript_path)
+        if not tr:
+            for p in self.dir.glob("transcript_*.md"):
+                tr = p.read_text(encoding="utf-8")
+                break
+        if tr.strip():
+            parts.append("## 转写摘录\n\n" + tr[:20000])
+        vis = self.read_visual_lines()
+        if vis:
+            parts.append("## 视觉事件\n\n" + "\n".join(vis[:50]))
+        st = self.read_state_lines()
+        if st:
+            parts.append("## 增量状态\n\n" + "\n".join(st[:50]))
+
+        text = "\n\n".join(parts) + "\n"
+        with self._lock:
+            self.partial_notes_path.write_text(text, encoding="utf-8")
+        return self.partial_notes_path
 
     # ---------- readers (for final summary) ----------
     def read_text_safe(self, path: Path) -> str:

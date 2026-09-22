@@ -33,7 +33,21 @@ start_course.ps1
 
 ## Upstream 最小修改（权威 diff）
 
-上游目录各自独立 git；以下为 `git diff` 实测输出。
+本仓库 vendored 上游后移除了嵌套 `.git`，**无法在本仓库内直接 `git diff` 重放**。
+下列内容为：
+
+1. `docs/qlens.patch` / `docs/hearsay.patch`：**记录用补丁文本**（UTF-8），
+   可在 `git clone` 上游对应 SHA 后尝试 `git apply`（上下文冲突时以本文件代码为准）。
+2. 下方内嵌 diff：**从当前 vendored 文件 vs 上游基线语义整理的可核对修改说明**，
+   不是保证 `git apply` 一次成功的严格 unified diff。
+
+基线 SHA：
+
+- qlens：`https://github.com/tomaszwi66/qlens.git` @ `9df009501d713dda4fb3cc29128e7a3629bc756d`
+- Hearsay：`https://github.com/parkscloud/Hearsay.git` @ `4d5a56d76ed67b6af9d823ef1c9691b9e5dc907c`
+
+Hearsay：`git status --short` 为空——**源码零修改**；`docs/hearsay.patch` 为空记录
+（说明见文件头注释，空文件本身不是“唯一证据”）。
 
 ### 1) `third_party/qlens/config.py`
 
@@ -47,6 +61,8 @@ start_course.ps1
 +MODEL_NAME = os.environ.get("VISION_MODEL", "qwen2.5vl:7b")
 +TEXT_MODEL_NAME = os.environ.get("TEXT_MODEL_NAME", "qwen2.5:7b")
 +FALLBACK_VISION_MODEL = os.environ.get("FALLBACK_VISION_MODEL", "qwen3-vl:4b")
+-REQUEST_TIMEOUT = 120
++REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
 ```
 
 ### 2) `third_party/qlens/core/ollama_client.py`
@@ -94,16 +110,14 @@ start_course.ps1
 
 ### 3) `third_party/Hearsay`
 
-`git status --short` 为空——**源码零修改**。Whisper 模型落盘在 `%APPDATA%\Hearsay\models`（运行时数据，非源码）。
-
-### 4) vendoring 溯源
-
-本仓库以 vendored 方式收录两个上游（嵌套 `.git` 已移除；补丁与基线 SHA 如下，可 `git clone` 上游 + `git apply` 复现修改）：
-
-- qlens：`https://github.com/tomaszwi66/qlens.git` @ `9df009501d713dda4fb3cc29128e7a3629bc756d`，diff → `docs/qlens.patch`
-- Hearsay：`https://github.com/parkscloud/Hearsay.git` @ `4d5a56d76ed67b6af9d823ef1c9691b9e5dc907c`，diff → `docs/hearsay.patch`（空，无修改）
+源码零修改（vendoring 时对基线 SHA 的 `git status --short` 为空）。
+Whisper 模型落盘在 `%APPDATA%\Hearsay\models`（运行时数据，非源码）。
 
 ### 4) 本应用层（非上游）
+
+应用层 `app/course_session/` 新增代码量以 `Get-ChildItem app/course_session/*.py`
+统计行数为准（约 1600+ 行，随稳定性修复变动；**不引用“900 行”等未核实数字**）。
+E2E 使用桌面 SlideDeck + TTS 产生真实屏幕/音频输入，**不是**自建 fixture 单测。
 
 `app/course_session/settings.py`：
 
@@ -138,6 +152,19 @@ qwen3-vl 上 `think:false` 无效（思考仍占位），故视觉/融合不传 
 - Ollama：`qwen3-vl:8b` 6.1GB + `qwen3-vl:4b` 3.3GB + `qwen38-27b` 10GB +（可选原模型 `qwen2.5vl:7b` 6.0GB / `qwen2.5:7b` 4.7GB）。
 - Whisper turbo：`%APPDATA%\Hearsay\models`（经 `HF_ENDPOINT=https://hf-mirror.com` 下载，直连超时）。
 - 会话产物：`sessions/<ts>/`（transcript / events / live_notes / course_state / final_summary）。
+
+## 稳定性约束（P1/P2 审计项）
+
+- **模型释放**：不硬编码待释放模型名；用 `settings.loaded_models()` 登记实际调用过的模型，
+  经 `ollama_base_url()`（urllib 解析 scheme://host，禁止 `replace("/api/chat","")`）调用
+  `/api/generate keep_alive=0`；释放失败只 log，不覆盖总结阶段的原始异常。
+- **Worker 门闩**：`WORKER_JOIN_TIMEOUT = REQUEST_TIMEOUT + CLEANUP_GRACE`；
+  `stop()` 在加载 `FINAL_MODEL` 前检查 `_lingering_workers()`，有存活线程则拒绝加载 27B。
+- **会话隔离**：目录名精确到秒 + 冲突后缀；`sessions/current_session.json` 为 active marker，
+  `stop_course.ps1` 优先读 marker，不再只按目录名排序猜测。
+- **音频启动回滚**：engine → pipeline → recorder 任一步失败按逆序 teardown；`stop()` 幂等。
+- **音频 fatal**：状态机 `RUNNING→STOPPING→FAILED`，停 worker，**不跑**完整 27B 总结，
+  写 `partial_notes.md`；GUI 展示 `StopResult` 真实成败。
 
 ## 已知限制
 

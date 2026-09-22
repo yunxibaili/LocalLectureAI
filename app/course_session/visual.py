@@ -11,11 +11,12 @@ only for the Ollama request body).
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 import traceback
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -30,6 +31,7 @@ from .settings import (
     MIN_VLM_INTERVAL_S,
     NUM_CTX_LIVE,
     VISION_MODEL,
+    mark_model_loaded,
 )
 
 log = logging.getLogger(__name__)
@@ -49,6 +51,53 @@ def _diff_score(prev_gray: np.ndarray, cur_gray: np.ndarray) -> float:
         return 255.0
     diff = cv2.absdiff(prev_gray, cur_gray)
     return float(cv2.mean(diff)[0])
+
+
+def _parse_json_loose(raw: str) -> Optional[dict]:
+    if not raw:
+        return None
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:]
+        s = s.strip()
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    start, end = s.find("{"), s.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(s[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def validate_visual_payload(obj: Any) -> tuple[bool, str]:
+    """Schema check for COURSE_VISUAL_SYSTEM JSON. Returns (ok, reason)."""
+    if not isinstance(obj, dict):
+        return False, f"not a JSON object (got {type(obj).__name__})"
+    # At least one primary content field must be a non-empty string.
+    primary = ("one_line_summary", "page_text", "change_vs_prev")
+    has_primary = any(
+        isinstance(obj.get(k), str) and obj.get(k).strip() for k in primary
+    )
+    if not has_primary:
+        return False, "missing primary content field (one_line_summary/page_text/change_vs_prev)"
+    # Optional typed fields, when present, must have the right type.
+    for key in ("new_formulas", "definitions", "examples"):
+        if key in obj and obj[key] is not None and not isinstance(obj[key], list):
+            return False, f"{key} must be array"
+    if "has_example" in obj and not isinstance(obj["has_example"], bool):
+        return False, "has_example must be boolean"
+    for key in ("code", "chart", "confidence_note"):
+        if key in obj and obj[key] is not None and not isinstance(obj[key], str):
+            return False, f"{key} must be string"
+    return True, ""
 
 
 class VisualStream(threading.Thread):
@@ -72,6 +121,7 @@ class VisualStream(threading.Thread):
         self.frame_id = 0
         self.vlm_calls = 0
         self.skipped_frames = 0
+        self.failed_analyses = 0
         self.last_error: str = ""
         self.last_description: str = ""   # one-line/JSON summary for prev-state
         self.last_status: str = ""
@@ -158,8 +208,9 @@ class VisualStream(threading.Thread):
                     except Exception:
                         log.error("on_event failed\n%s", traceback.format_exc())
                 else:
-                    self.last_error = "VLM call failed (see log)"
-                    # keep prev_analyzed unchanged so we retry next loop
+                    self.failed_analyses += 1
+                    # keep prev_analyzed unchanged so we retry next loop;
+                    # do NOT count as success, do NOT advance last_vlm_ts
                     self._stop_evt.wait(3.0)
 
             self.frame_id += 1
@@ -171,65 +222,93 @@ class VisualStream(threading.Thread):
         self.last_status = "Visual stream stopped"
 
     # ------------------------------------------------------------------
+    def _chat_once(
+        self,
+        infer_img: np.ndarray,
+        user_prompt: str,
+        model: str,
+        as_json: bool,
+    ) -> str:
+        raw = chat(
+            infer_img,
+            COURSE_VISUAL_SYSTEM,
+            user_prompt,
+            temperature=0.1,
+            as_json=as_json,
+            model=model,
+            # Do NOT pass think=False: known Ollama bug (qwen family) breaks
+            # format/empty-content. Thinking still runs; give it room.
+            num_predict=NUM_CTX_LIVE,
+            num_ctx=NUM_CTX_LIVE,
+        )
+        mark_model_loaded(model)
+        return (raw or "").strip()
+
     def _analyze(self, frame: np.ndarray, prev_summary: str) -> tuple[str, bool]:
-        """Call VLM on an in-memory frame. Returns (description, ok)."""
+        """Call VLM on an in-memory frame. Returns (description, ok).
+
+        ok=True only when the payload parses as JSON and passes schema
+        validation. On validation failure: one as_json=False retry, then fail
+        (no success, no state advance).
+        """
         infer_img, _mapper = prepare_image(frame, self._region, INFER_SIZE)
         user_prompt = build_visual_prompt(prev_summary)
+
+        raw = ""
         try:
-            raw = chat(
-                infer_img,
-                COURSE_VISUAL_SYSTEM,
-                user_prompt,
-                temperature=0.1,
-                as_json=True,          # prompt mandates JSON; Ollama format=json
-                model=self._model,
-                # Do NOT pass think=False: known Ollama bug (qwen family) breaks
-                # format/empty-content. Thinking still runs; give it room.
-                num_predict=NUM_CTX_LIVE,
-                num_ctx=NUM_CTX_LIVE,
-            )
+            raw = self._chat_once(infer_img, user_prompt, self._model, as_json=True)
         except Exception as e:
-            log.warning("VLM %s failed (%s); trying fallback %s",
-                        self._model, e, self._fallback_model)
+            log.warning(
+                "VLM %s failed (%s); trying fallback %s",
+                self._model, e, self._fallback_model,
+            )
             try:
-                raw = chat(
-                    infer_img,
-                    COURSE_VISUAL_SYSTEM,
-                    user_prompt,
-                    temperature=0.1,
-                    as_json=True,
-                    model=self._fallback_model,
-                    num_predict=NUM_CTX_LIVE,
-                    num_ctx=NUM_CTX_LIVE,
+                raw = self._chat_once(
+                    infer_img, user_prompt, self._fallback_model, as_json=True
                 )
             except Exception as e2:
                 log.error("fallback VLM failed\n%s", traceback.format_exc())
                 self.last_error = str(e2)
                 return "", False
 
-        desc = (raw or "").strip()
-        if not desc:
-            # Thinking models occasionally truncate content under format=json;
-            # retry once without grammar (prompt still mandates JSON output).
-            try:
-                raw = chat(
-                    infer_img,
-                    COURSE_VISUAL_SYSTEM,
-                    user_prompt,
-                    temperature=0.1,
-                    as_json=False,
-                    model=self._model,
-                    num_predict=NUM_CTX_LIVE,
-                    num_ctx=NUM_CTX_LIVE,
-                )
-                desc = (raw or "").strip()
-            except Exception:
-                log.warning("empty-content retry failed", exc_info=True)
-        if not desc:
+        obj = _parse_json_loose(raw) if raw else None
+        if obj is not None:
+            ok, reason = validate_visual_payload(obj)
+            if ok:
+                desc = raw
+                one_line = str(obj.get("one_line_summary") or raw).replace("\n", " ")
+                if len(one_line) > 500:
+                    one_line = one_line[:500] + "…"
+                self.last_description = one_line
+                self.last_error = ""
+                return desc, True
+            log.warning("visual JSON invalid (%s); retrying as_json=False", reason)
+        elif not raw:
+            log.warning("empty visual content; retrying as_json=False")
+        else:
+            log.warning("visual payload not JSON; retrying as_json=False")
+
+        # one retry without grammar (prompt still mandates JSON output)
+        try:
+            raw2 = self._chat_once(infer_img, user_prompt, self._model, as_json=False)
+        except Exception:
+            log.warning("as_json=False retry failed", exc_info=True)
+            self.last_error = "visual JSON invalid after retry"
             return "", False
-        # short one-line prev-state summary carried into the next prompt
-        one_line = desc.replace("\n", " ")
+        obj2 = _parse_json_loose(raw2) if raw2 else None
+        if obj2 is None:
+            self.last_error = "visual response not JSON after retry"
+            log.error("visual retry still not JSON: %s", (raw2 or "")[:200])
+            return "", False
+        ok2, reason2 = validate_visual_payload(obj2)
+        if not ok2:
+            self.last_error = f"visual schema invalid: {reason2}"
+            log.error("visual retry schema fail: %s", reason2)
+            return "", False
+
+        one_line = str(obj2.get("one_line_summary") or raw2).replace("\n", " ")
         if len(one_line) > 500:
             one_line = one_line[:500] + "…"
         self.last_description = one_line
-        return desc, True
+        self.last_error = ""
+        return raw2, True

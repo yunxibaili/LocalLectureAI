@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
 )
 
 from .settings import VISION_MODEL, FINAL_MODEL, SESSIONS_DIR  # noqa: E402
-from .session import CourseSession  # noqa: E402
+from .session import CourseSession, StopResult  # noqa: E402
 
 # Reuse QLens region selector (unmodified upstream).
 from core.region_selector import RegionSelector  # noqa: E402
@@ -47,6 +47,29 @@ STYLE_STOP = (
     "QPushButton:hover { background-color:#ef4444; }"
     "QPushButton:disabled { background-color:#555; color:#999; }"
 )
+
+
+def format_stop_result(r: StopResult) -> str:
+    """Honest user-facing line for a StopResult (never fake success)."""
+    if r.success and r.summary_path and r.summary_path.endswith("final_summary.md"):
+        base = f"课程已结束，final_summary.md 已生成：{r.summary_path}"
+        if r.partial_available:
+            base += "（另有 partial_notes.md）"
+        return base
+    if r.success and r.partial_available and r.summary_path:
+        return f"课程已结束（部分笔记）：{r.summary_path}"
+    parts = [f"课程结束状态: {r.state}"]
+    if r.error:
+        parts.append(f"错误: {r.error}")
+    if r.partial_available and r.summary_path:
+        parts.append(f"部分笔记可用: {r.summary_path}")
+    elif r.partial_available:
+        parts.append("部分笔记可用（partial_notes.md）")
+    if r.lingering_workers:
+        parts.append(f"未退出线程: {r.lingering_workers}")
+    if not r.success and not r.error and not r.partial_available:
+        parts.append("未生成完整总结")
+    return " | ".join(parts)
 
 
 class CourseWindow(QMainWindow):
@@ -129,7 +152,10 @@ class CourseWindow(QMainWindow):
         self._stopping = False
         self._session = None
         self.log.appendPlainText(msg)
-        self.statusBar().showMessage("已结束")
+        if msg.startswith("课程已结束"):
+            self.statusBar().showMessage("已结束")
+        else:
+            self.statusBar().showMessage("已结束（有错误/部分完成）")
 
     def _status_cb(self, msg: str) -> None:
         self.status_signal.emit(msg)
@@ -192,8 +218,8 @@ class CourseWindow(QMainWindow):
     def _stop_worker(self) -> None:
         try:
             assert self._session is not None
-            self._session.stop(wait_final_summary=True)
-            self.stopped_signal.emit("课程已结束，final_summary.md 已生成。")
+            result = self._session.stop(wait_final_summary=True)
+            self.stopped_signal.emit(format_stop_result(result))
         except Exception as e:
             log.error("session stop failed\n%s", traceback.format_exc())
             self.stopped_signal.emit(f"结束时出错: {e}")
@@ -202,7 +228,8 @@ class CourseWindow(QMainWindow):
     def closeEvent(self, e) -> None:
         try:
             if self._session is not None and self._session.running:
-                self._session.stop(wait_final_summary=False)
+                r = self._session.stop(wait_final_summary=False)
+                log.info("close stop result: %s", r)
         except Exception:
             pass
         super().closeEvent(e)

@@ -1,0 +1,6 @@
+﻿# Hearsay upstream diff: EMPTY (source unmodified).
+# Baseline: parkscloud/Hearsay @ 4d5a56d76ed67b6af9d823ef1c9691b9e5dc907c
+# Verification: git status --short was empty against that baseline after vendoring;
+# nested .git was removed so this file is a recorded statement, not a re-runnable patch.
+# Runtime config (language/model) lives under %APPDATA%\Hearsay\ and is not source.
+

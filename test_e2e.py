@@ -1,4 +1,5 @@
 # End-to-end CourseSession test: audio + visual + fusion + final summary.
+import json
 import os
 import sys
 import time
@@ -40,9 +41,9 @@ while time.monotonic() - t_start < LIVE_S:
 
 print("stopping (incl. final fusion + final_summary)...", flush=True)
 t_stop = time.monotonic()
-sess.stop(wait_final_summary=True)
+stop_result = sess.stop(wait_final_summary=True)
 t_done = time.monotonic() - t_stop
-print(f"stop completed in {t_done:.1f}s", flush=True)
+print(f"stop completed in {t_done:.1f}s result={stop_result}", flush=True)
 
 # ---------------- verify artifacts ----------------
 d = sess.storage.dir
@@ -54,16 +55,49 @@ checks["live_notes.md"] = (d / "live_notes.md").exists() and (d / "live_notes.md
 checks["transcript.md"] = (d / "transcript.md").exists() and (d / "transcript.md").stat().st_size > 100
 fs = d / "final_summary.md"
 checks["final_summary.md"] = fs.exists() and fs.stat().st_size > 500
+checks["stop_result_success"] = bool(stop_result.success)
+checks["stop_state_stopped"] = stop_result.state == "stopped"
+checks["no_lingering_workers"] = not stop_result.lingering_workers
+
+# content assertions (P2-6)
+if checks["events.jsonl"]:
+    lines = [ln for ln in (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
+    ok_ev = False
+    for ln in lines:
+        try:
+            o = json.loads(ln)
+            if (o.get("text") or "").strip():
+                ok_ev = True
+                break
+        except Exception:
+            continue
+    checks["events_nonempty_text"] = ok_ev
+
+if checks["live_notes.md"]:
+    ln = (d / "live_notes.md").read_text(encoding="utf-8")
+    checks["live_notes_has_header"] = ln.lstrip().startswith("#") and not ln.lstrip().startswith("##")
+    checks["live_notes_has_section"] = "##" in ln
+
+if checks["transcript.md"]:
+    tr = (d / "transcript.md").read_text(encoding="utf-8")
+    checks["transcript_has_cjk"] = any("一" <= c <= "鿿" for c in tr)
+
+if checks["final_summary.md"]:
+    fs_text = fs.read_text(encoding="utf-8")
+    checks["final_summary_has_course_theme"] = ("课程主题" in fs_text) or ("知识体系" in fs_text)
+    checks["final_summary_not_placeholder"] = "无法生成总结" not in fs_text
+    checks["final_summary_generated_by_model"] = "qwen38" in fs_text or "generated" in fs_text.lower()
 
 snap = sess.snapshot()
 print("=" * 60, flush=True)
 print(f"session dir: {d}", flush=True)
 print(f"snap: tr={snap['transcripts']} vis={snap['visual_events']} vlm={snap['vlm_calls']} "
-      f"skip={snap['vlm_skipped']} upd={snap['updates']} topic={snap['topic']!r}", flush=True)
+      f"skip={snap['vlm_skipped']} upd={snap['updates']} topic={snap['topic']!r} "
+      f"state={snap['state']} workers={snap['workers_alive']}", flush=True)
 for name, ok in checks.items():
-    p = d / name
-    size = p.stat().st_size if p.exists() else 0
-    print(f"  {'OK ' if ok else 'FAIL'} {name} ({size} bytes)", flush=True)
+    p = d / name if (d / name).exists() else None
+    size = p.stat().st_size if p else 0
+    print(f"  {'OK ' if ok else 'FAIL'} {name}" + (f" ({size} bytes)" if p else ""), flush=True)
 
 # content spot-checks
 if checks["transcript.md"]:

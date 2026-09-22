@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 QLENS_DIR = ROOT / "third_party" / "qlens"
@@ -33,10 +35,50 @@ FUSION_MODEL = _env("FUSION_MODEL", VISION_MODEL)
 # Post-class, exclusive high-quality model.
 FINAL_MODEL = _env("FINAL_MODEL", "qwen38-27b-main:latest")
 REQUEST_TIMEOUT = int(_env("REQUEST_TIMEOUT", "180"))
+# Grace period added on top of REQUEST_TIMEOUT when joining worker threads
+# before loading the exclusive post-class model (VRAM safety).
+CLEANUP_GRACE = int(_env("CLEANUP_GRACE", "30"))
+WORKER_JOIN_TIMEOUT = REQUEST_TIMEOUT + CLEANUP_GRACE
 # Ollama context: thinking models burn ctx before answering; image+prompt need
 # headroom (default 4096 truncated content -> empty replies). Verified locally.
 NUM_CTX_LIVE = int(_env("NUM_CTX_LIVE", "8192"))
 NUM_CTX_FINAL = int(_env("NUM_CTX_FINAL", "16384"))
+
+
+def ollama_base_url(ollama_url: str | None = None) -> str:
+    """Scheme://host[:port] for any Ollama endpoint URL (never string-replace)."""
+    raw = ollama_url if ollama_url is not None else OLLAMA_URL
+    p = urlparse(raw)
+    if not p.scheme or not p.netloc:
+        raise ValueError(f"invalid OLLAMA_URL: {raw!r}")
+    return f"{p.scheme}://{p.netloc}"
+
+
+# --- Loaded-model registry (what this process actually used) ---
+_model_reg_lock = threading.Lock()
+_LOADED_MODELS: set[str] = set()
+
+
+def mark_model_loaded(name: str) -> None:
+    """Record a model name after a successful Ollama call that loaded it."""
+    if not name:
+        return
+    with _model_reg_lock:
+        _LOADED_MODELS.add(name)
+
+
+def loaded_models() -> set[str]:
+    with _model_reg_lock:
+        return set(_LOADED_MODELS)
+
+
+def forget_loaded_models(names: set[str] | None = None) -> None:
+    with _model_reg_lock:
+        if names is None:
+            _LOADED_MODELS.clear()
+        else:
+            _LOADED_MODELS.difference_update(names)
+
 
 # --- Visual stream ---
 INFER_SIZE = int(_env("INFER_SIZE", "1024"))
@@ -62,6 +104,8 @@ RECENT_TRANSCRIPT_EVENTS = int(_env("RECENT_TRANSCRIPT_EVENTS", "40"))
 RECENT_VISUAL_EVENTS = int(_env("RECENT_VISUAL_EVENTS", "6"))
 
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+# Active-session marker written by SessionStorage on start / cleared on stop.
+ACTIVE_SESSION_MARKER = SESSIONS_DIR / "current_session.json"
 
 
 def _ensure_cuda_dlls() -> None:
