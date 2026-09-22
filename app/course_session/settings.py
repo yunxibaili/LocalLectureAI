@@ -88,12 +88,13 @@ def forget_loaded_models(names: set[str] | None = None) -> None:
 
 
 # --- Ollama /api/ps queries (authoritative liveness check) ---
-def list_loaded_models_via_api() -> set[str]:
+def list_loaded_models_via_api() -> set[str] | None:
     """Query Ollama /api/ps for models actually resident in VRAM.
 
-    Returns set of model names currently loaded. Empty set on any error
-    (connection refused, timeout, etc.) — callers must treat empty as
-    "unknown / cannot verify" not "nothing loaded".
+    Returns set of resident model names (may be empty when nothing is
+    loaded), or None when /api/ps cannot be queried (HTTP error,
+    connection refused, timeout). Callers must treat None as
+    "unknown / cannot verify", not as "nothing loaded".
     """
     try:
         import requests
@@ -102,7 +103,7 @@ def list_loaded_models_via_api() -> set[str]:
         r = requests.get(f"{base}/api/ps", timeout=5)
         if r.status_code >= 400:
             log.warning("GET /api/ps returned HTTP %d", r.status_code)
-            return set()
+            return None
         data = r.json()
         models = data.get("models", [])
         names: set[str] = set()
@@ -115,16 +116,17 @@ def list_loaded_models_via_api() -> set[str]:
         return names
     except Exception as e:
         log.warning("GET /api/ps failed: %s", e)
-        return set()
+        return None
 
 
 def is_model_resident(name: str) -> bool | None:
     """Check if a specific model is resident via /api/ps.
 
     Returns True/False if verified, None if cannot query /api/ps.
+    An empty successful /api/ps (no models loaded) returns False.
     """
     resident = list_loaded_models_via_api()
-    if not resident:
+    if resident is None:
         return None  # cannot verify
     # exact match or prefix match (tag handling)
     for r in resident:

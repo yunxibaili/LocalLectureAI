@@ -426,11 +426,12 @@ try:
          patch.object(fs, "is_model_resident", _fake_resident_true), \
          patch("requests.post", _fake_post_500):
         ok_b, errs_b = fs.release_realtime_models(exclude={"qwen38-27b-main:latest"})
-    check(ok_b is False, f"Test B: release returns False on HTTP 500 + still resident (got {ok_b})")
-    check(any("500" in e or "resident" in e for e in errs_b),
-          f"Test B: errors mention HTTP/resident: {errs_b}")
-    # After failed release, can_load_final_model should refuse
-    can_b, reason_b = fs.can_load_final_model()
+        check(ok_b is False, f"Test B: release returns False on HTTP 500 + still resident (got {ok_b})")
+        check(any("500" in e or "resident" in e for e in errs_b),
+              f"Test B: errors mention HTTP/resident: {errs_b}")
+        # After failed release, can_load_final_model should refuse
+        # (must stay inside mock: /api/ps still shows VLM resident)
+        can_b, reason_b = fs.can_load_final_model()
     check(can_b is False, f"Test B: can_load_final_model refuses when VLM resident (got {can_b}, {reason_b})")
 finally:
     forget_loaded_models()
@@ -457,11 +458,11 @@ try:
          patch.object(fs, "is_model_resident", _fake_resident_true_c), \
          patch("requests.post", _fake_post_ok_c):
         ok_c, errs_c = fs.release_realtime_models(exclude={"qwen38-27b-main:latest"})
-    check(ok_c is False, f"Test C: release returns False when /api/ps still shows model (got {ok_c})")
-    check(any("STILL RESIDENT" in e or "still resident" in e for e in errs_c),
-          f"Test C: error mentions still resident: {errs_c}")
+        check(ok_c is False, f"Test C: release returns False when /api/ps still shows model (got {ok_c})")
+        check(any("STILL RESIDENT" in e or "still resident" in e for e in errs_c),
+              f"Test C: error mentions still resident: {errs_c}")
 
-    can_c, reason_c = fs.can_load_final_model()
+        can_c, reason_c = fs.can_load_final_model()
     check(can_c is False, f"Test C: can_load_final_model refuses (got {can_c}, {reason_c})")
 finally:
     forget_loaded_models()

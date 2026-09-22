@@ -130,18 +130,17 @@ def release_realtime_models(exclude: set[str] | None = None) -> tuple[bool, list
 
     # Final verification: if any managed/registry model still resident -> FAIL
     final_resident = list_loaded_models_via_api()
-    still_resident = []
-    if final_resident:
-        for name in targets:
-            if name in final_resident or any(name in r for r in final_resident):
-                still_resident.append(name)
-    if still_resident:
-        return False, errors + [f"STILL RESIDENT: {', '.join(still_resident)}"]
-    if not final_resident:
-        # cannot verify — treat as failure if we had targets (conservative)
+    if final_resident is None:
+        # cannot query /api/ps — conservative failure when we had targets
         if targets:
             return False, errors + ["cannot verify /api/ps — treating as cleanup failure"]
         return True, errors
+    still_resident = []
+    for name in targets:
+        if name in final_resident or any(name in r for r in final_resident):
+            still_resident.append(name)
+    if still_resident:
+        return False, errors + [f"STILL RESIDENT: {', '.join(still_resident)}"]
     return True, errors
 
 
@@ -155,10 +154,10 @@ def can_load_final_model() -> tuple[bool, str]:
 
     Returns (allowed, reason).
     """
-    # Check /api/ps for realtime models
+    # Check /api/ps for realtime models (None = cannot verify; empty set = clean)
     resident = list_loaded_models_via_api()
-    if not resident:
-        return False, "cannot verify /api/ps (empty or error) — refuse to load 27B"
+    if resident is None:
+        return False, "cannot verify /api/ps (query failed) — refuse to load 27B"
 
     # Realtime models that must NOT be resident
     realtime = {VISION_MODEL, FUSION_MODEL}
@@ -196,7 +195,7 @@ def preflight_cleanup() -> tuple[bool, str]:
     managed = {_FM, VISION_MODEL, FUSION_MODEL}
 
     resident = list_loaded_models_via_api()
-    if not resident:
+    if resident is None:
         # cannot query — conservative: if FINAL_MODEL in registry, refuse
         if _FM in loaded_models():
             return False, "Previous final model may still be resident (cannot verify /api/ps)."
@@ -259,10 +258,16 @@ def preflight_cleanup() -> tuple[bool, str]:
 
     # Final verify
     resident_final = list_loaded_models_via_api()
-    if resident_final:
-        for name in to_unload:
-            if any(name == r or name in r for r in resident_final):
-                return False, f"Previous final model is still resident: {name}"
+    if resident_final is None:
+        if _FM in loaded_models():
+            return False, (
+                "Previous final model may still be resident "
+                "(cannot verify /api/ps after unload)."
+            )
+        return True, f"unloaded managed models: {', '.join(to_unload)}"
+    for name in to_unload:
+        if any(name == r or name in r for r in resident_final):
+            return False, f"Previous final model is still resident: {name}"
 
     return True, f"unloaded managed models: {', '.join(to_unload)}"
 

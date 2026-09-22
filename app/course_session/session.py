@@ -292,6 +292,7 @@ class CourseSession:
     ) -> StopResult:
         """Stop streams, then (optionally) generate final summary.
 
+        Thin wrapper: concurrency handling then unified _cleanup_core path.
         Returns StopResult — success only if workers stopped AND (when
         requested AND not failed) final_summary.md was written.
         Never loads FINAL_MODEL while a worker is still alive (VRAM gate).
@@ -306,33 +307,66 @@ class CourseSession:
             if self._stop_result is not None:
                 return self._stop_result
 
+        return self._cleanup_core(
+            stop_visual=True,
+            stop_audio=True,
+            stop_fusion=True,
+            release_models=True,
+            wait_final_summary=wait_final_summary,
+            failed=failed,
+        )
+
+    def _cleanup_core(
+        self,
+        stop_visual: bool = True,
+        stop_audio: bool = True,
+        stop_fusion: bool = True,
+        release_models: bool = True,
+        wait_final_summary: bool = True,
+        failed: bool = False,
+    ) -> StopResult:
+        """Unified cleanup path for stop / audio-fatal / exception.
+
+        Sequence (constraint 4 — single path, no three release logics):
+          stop workers -> join + liveness verify -> release realtime models
+          -> /api/ps verify -> cleanup result (+ optional final summary).
+        """
+        if self._stop_result is not None:
+            return self._stop_result
+
         self._finalizing = True
         self.state = SessionState.STOPPING
         summary_path: Optional[str] = None
         stop_error: Optional[str] = None
+        cleanup_status = CleanupStatus.CLEANUP_OK
 
-        self._status("正在停止视觉流…")
-        if self.visual:
-            self.visual.stop()
-            self.visual.join(timeout=WORKER_JOIN_TIMEOUT)
+        if stop_visual:
+            self._status("正在停止视觉流…")
+            if self.visual:
+                self.visual.stop()
+                self.visual.join(timeout=WORKER_JOIN_TIMEOUT)
 
-        self._status("正在停止音频与 Whisper…")
-        if self.audio:
+        if stop_audio:
+            self._status("正在停止音频与 Whisper…")
+            if self.audio:
+                try:
+                    audio_cleanup_ok = self.audio.stop()
+                    if audio_cleanup_ok is False:
+                        stop_error = "audio stop: workers still alive after join"
+                except Exception as e:
+                    stop_error = f"audio stop failed: {e}"
+                    log.error("audio stop failed", exc_info=True)
+
+        if stop_fusion:
+            self._stop_fusion.set()
+            if self._fusion_thread:
+                self._fusion_thread.join(timeout=WORKER_JOIN_TIMEOUT)
+
+            # final fusion for any leftovers
             try:
-                self.audio.stop()
-            except Exception as e:
-                stop_error = f"audio stop failed: {e}"
-                log.error("audio stop failed", exc_info=True)
-
-        self._stop_fusion.set()
-        if self._fusion_thread:
-            self._fusion_thread.join(timeout=WORKER_JOIN_TIMEOUT)
-
-        # final fusion for any leftovers
-        try:
-            self._fuse_once()
-        except Exception:
-            log.error("final fusion failed", exc_info=True)
+                self._fuse_once()
+            except Exception:
+                log.error("final fusion failed", exc_info=True)
 
         self.storage.finalize_transcript()
         self.running = False
@@ -349,8 +383,33 @@ class CourseSession:
             stop_error = (stop_error + "; " if stop_error else "") + msg
             wait_final_summary = False
 
+        # Release tracked realtime models + /api/ps verify (unified path).
+        if release_models:
+            from .final_summary import release_realtime_models
+
+            self._status("正在释放实时模型并校验 /api/ps…")
+            try:
+                rel_ok, rel_errs = release_realtime_models()
+                if not rel_ok:
+                    cleanup_status = CleanupStatus.CLEANUP_FAILED
+                    msg = "model release failed: " + ("; ".join(rel_errs) or "unknown")
+                    stop_error = (stop_error + "; " if stop_error else "") + msg
+                    wait_final_summary = False
+                    log.error(msg)
+                elif rel_errs:
+                    log.warning("model release warnings: %s", "; ".join(rel_errs))
+            except Exception as e:
+                cleanup_status = CleanupStatus.CLEANUP_FAILED
+                stop_error = (stop_error + "; " if stop_error else "") + f"release raised: {e}"
+                wait_final_summary = False
+                log.error("release_realtime_models raised", exc_info=True)
+
         # Audio-fatal path: no full summary, but always write partial notes.
         if failed or self._audio_failed or (self.last_error or "").startswith("audio fatal"):
+            wait_final_summary = False
+
+        # Cleanup FAILED -> hard gate: never load FINAL_MODEL (constraint 3).
+        if cleanup_status != CleanupStatus.CLEANUP_OK:
             wait_final_summary = False
 
         if wait_final_summary:
@@ -386,7 +445,11 @@ class CourseSession:
             # but partial_available tells them notes exist.
             success = False
         else:
-            success = workers_ok and stop_error is None
+            success = (
+                workers_ok
+                and stop_error is None
+                and cleanup_status == CleanupStatus.CLEANUP_OK
+            )
             if wait_final_summary:
                 success = success and summary_path is not None and (
                     self.storage.final_summary_path.exists()
@@ -416,7 +479,8 @@ class CourseSession:
         )
         self._status(
             f"课程会话已结束 state={self._stop_result.state} "
-            f"success={self._stop_result.success}"
+            f"success={self._stop_result.success} "
+            f"cleanup={cleanup_status}"
         )
         return self._stop_result
 

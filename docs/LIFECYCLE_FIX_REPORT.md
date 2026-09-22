@@ -186,9 +186,15 @@ cleanup result (StopResult)
 | 命令 | 结果 |
 |---|---|
 | AST parse（app/course_session/*.py） | PASS（12 files） |
-| `test_stability.py`（含 Test A–H） | PASS / 见终端 |
-| `third_party/Hearsay/tests/test_pipeline_writer.py` | PASS / 见终端 |
-| `/api/ps` 残留检查 | 见终端（测试模型已清理） |
+| `test_stability.py`（含 Test A–H） | PASS（0 failures，exit 0） |
+| `third_party/Hearsay/tests/test_pipeline_writer.py` | PASS（ALL CHECKS PASSED，exit 0） |
+| `/api/ps` 残留检查 | `{"models":[]}`（无残留） |
+
+### Round 3 落盘补丁（提交时发现）
+
+1. **`_cleanup_core` 此前未写入 `session.py`**（早先 edit 失败未重试）：`stop()`/`_on_audio_fatal`/Test F–G 均引用该方法。现已补上统一路径，`stop()` 变薄包装。
+2. **`/api/ps` 空集 vs 查询失败语义**：`list_loaded_models_via_api` 原先错误与“无模型”都返回 `set()`，导致成功卸载后仍判 cleanup 失败。现改为：查询失败 → `None`；成功且无模型 → `set()`（可加载 27B）。`is_model_resident` / `can_load_final_model` / `release_realtime_models` / `preflight_cleanup` 同步区分。
+3. **Test B/C 的 `can_load_final_model` 断言**移入 mock 上下文内，确保断言的是“/api/ps 仍 resident → 拒绝”而非真实空 `/api/ps`。
 
 ---
 
