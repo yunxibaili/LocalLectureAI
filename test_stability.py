@@ -192,7 +192,7 @@ import app.course_session.audio_bridge as ab  # noqa: E402
 
 
 class _FakeEngineCls:
-    def __init__(self, **kw):
+    def __init__(self, *args, **kw):
         pass
 
     def load(self):
@@ -203,7 +203,7 @@ class _FakeEngineCls:
 
 
 class _FakePipeCls:
-    def __init__(self, **kw):
+    def __init__(self, *args, **kw):
         self.stopped = False
 
     def start(self):
@@ -218,6 +218,9 @@ class _FakePipeCls:
 
 
 class _FakeRecCls:
+    def __init__(self, *args, **kw):
+        pass
+
     def start(self):
         raise RuntimeError("simulated recorder failure")
 
