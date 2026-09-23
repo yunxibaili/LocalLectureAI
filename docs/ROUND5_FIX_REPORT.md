@@ -74,30 +74,20 @@ Forbidden: loading 27B while realtime VLM/workers alive; skipping Final Fusion w
 
 Anti-false-pass scan: no always-true `or True` asserts; no bare `except Exception: pass`; exit 1 on any FAIL.
 
-## 7. Real Ollama integration (this machine)
+## 7. Real Ollama verification (this machine)
 
-### Minimal fusion path (`_round5_integration.py`) — **10/10 PASS**
+A temporary integration script was executed during Round 5 and was **not**
+committed to the repository. Therefore those "10/10" step counts are **not
+reproducible evidence** for Round 6 reviewers and are **not claimed as tests**.
 
-| Step | Result |
-|---|---|
-| baseline `/api/ps` | `[]` |
-| 8B call `qwen3-vl:8b` | OK, resident `['qwen3-vl:8b']` |
-| `release_realtime_models()` | `(True, [])`, ps `[]` |
-| `fuse_final` on FINAL_MODEL | `'success'`, resident `['qwen38-27b-main:latest']` |
-| `release_final_model()` | `(True, [])`, ps `[]` |
-| `is_final_model_resident()` | `False` |
+What was observed ad-hoc (not re-runnable from the repo):
+- `/api/ps` empty before and after
+- `qwen3-vl:8b` realtime call + release → ps empty
+- `qwen38-27b` fuse_final/summary + release → ps empty
+- models never resident together
 
-### Minimal Final Summary path — **PASS**
-
-| Step | Result |
-|---|---|
-| `generate_final_summary` | wrote `final_summary.md` (656 bytes, header `by qwen38-27b-main:latest`) |
-| ps after summary | `['qwen38-27b-main:latest']` |
-| `release_final_model()` | `(True, [])` |
-| ps after release | `[]` |
-| final not resident | `False` |
-
-Throughout: `qwen3-vl` and `qwen38-27b` never resident together.
+**Round 6 authority:** `test_stability.py` (Test X/Y/Z/AA–AG) + AST +
+Hearsay `test_pipeline_writer.py` + current `/api/ps` = `{"models":[]}`.
 
 ## 8. Verification summary
 
@@ -106,9 +96,7 @@ Throughout: `qwen3-vl` and `qwen38-27b` never resident together.
 | `test_stability.py` | `STABILITY_UNIT_TEST PASS`, exit **0** |
 | AST `py_compile` (4 files) | `AST_OK` |
 | Hearsay `test_pipeline_writer.py` | `ALL CHECKS PASSED` / `HEARSAY_OK` |
-| Final `/api/ps` | `{"models":[]}` |
-| Integration fusion | 10/10 |
-| Integration summary | PASS |
+| `/api/ps` at Round 5 end | `{"models":[]}` |
 
 ## Files changed
 

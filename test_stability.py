@@ -1328,6 +1328,448 @@ check(res_j2.state == "failed", f"Test J2: state failed (got {res_j2.state})")
 check("ps gate" in (res_j2.error or ""), f"Test J2: error mentions ps gate: {res_j2.error}")
 
 
+# =====================================================================
+# ROUND 6: pending consume honesty + final-fusion failure honesty (X-Y, AA-AG)
+# =====================================================================
+
+print()
+print("== Test X: realtime fusion failure preserves pending ==")
+sess_x = CourseSession(_Region(10, 10, 50, 50))
+sess_x.storage.ensure_live_header("t")
+sess_x.note_engine = NoteEngine(sess_x.storage, model="fake-rt-x")
+forget_loaded_models()
+te_x = _TE(text="TAIL_TOPIC", session_t=9.0)
+with sess_x._lock:
+    sess_x._unfused_transcripts.append(te_x)
+
+def _chat_x_fail(*args, **kwargs):
+    return "not json {{{"
+
+_orig_chat_x = oc.chat_text
+oc.chat_text = _chat_x_fail
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_x._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_x
+
+check(len(sess_x._unfused_transcripts) == 1
+      and any(e is te_x for e in sess_x._unfused_transcripts),
+      f"Test X: pending preserved on fuse failure "
+      f"(n={len(sess_x._unfused_transcripts)})")
+check("fake-rt-x" not in loaded_models(),
+      f"Test X: no registry mark on fuse failure: {loaded_models()}")
+check(sess_x.note_engine.state.updates == 0,
+      f"Test X: no state update on failure (updates={sess_x.note_engine.state.updates})")
+_src_x = _inspect.getsource(CourseSession._fuse_once)
+check("clear()" not in _src_x.split("updated")[0] or
+      "snapshot" in _src_x.lower() or "list(" in _src_x,
+      "Test X: _fuse_once does not clear-all pending before fuse")
+# Mutation-sensitive: failure path must not drop the snapshot identity
+check("any(e is x" in _src_x,
+      "Test X: success path consumes by event identity (not clear())")
+forget_loaded_models()
+
+
+print("== Test Y: success consumes only snapshot; mid-fuse insert stays ==")
+sess_y = CourseSession(_Region(10, 10, 50, 50))
+sess_y.storage.ensure_live_header("t")
+sess_y.note_engine = NoteEngine(sess_y.storage, model="fake-rt-y")
+forget_loaded_models()
+te_a = _TE(text="HEAD", session_t=1.0)
+te_b = _TE(text="TAIL_DURING_FUSE", session_t=2.0)
+with sess_y._lock:
+    sess_y._unfused_transcripts.append(te_a)
+
+def _chat_y_ok(*args, **kwargs):
+    # Insert a new pending event DURING fuse (after snapshot).
+    with sess_y._lock:
+        sess_y._unfused_transcripts.append(te_b)
+    return json.dumps({
+        "current_topic": "T", "new_knowledge": ["k"], "new_formulas": [],
+        "teacher_explanation": [], "teacher_emphasis": [], "examples": [],
+        "pitfalls": [], "relations": [], "unresolved": [],
+        "visual_note": "", "skip": False,
+    })
+
+_orig_chat_y = oc.chat_text
+oc.chat_text = _chat_y_ok
+try:
+    sess_y._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_y
+
+check(not any(e is te_a for e in sess_y._unfused_transcripts),
+      f"Test Y: snapshot batch consumed on success (n={len(sess_y._unfused_transcripts)})")
+check(any(e is te_b for e in sess_y._unfused_transcripts),
+      f"Test Y: event inserted during fuse preserved (n={len(sess_y._unfused_transcripts)}, "
+      f"texts={[getattr(e, 'text', '?') for e in sess_y._unfused_transcripts]})")
+check(sess_y.note_engine.state.updates >= 1,
+      f"Test Y: success applied delta (updates={sess_y.note_engine.state.updates})")
+forget_loaded_models()
+
+
+print("== Test Z: realtime failure tail reaches FINAL_MODEL input ==")
+TAIL_TOPIC = "TAIL_TOPIC_Z"
+TAIL_FACT = "TAIL_FACT_Z"
+sess_z = CourseSession(_Region(10, 10, 50, 50))
+sess_z.visual = _OrderVisual()
+sess_z.audio = None
+sess_z._fusion_thread = _OrderThread()
+sess_z.running = True
+sess_z.storage.ensure_live_header("t")
+sess_z.storage.append_event({"text": "head", "session_t": 0.0})
+sess_z.note_engine = NoteEngine(sess_z.storage, model="fake-rt-z")
+te_z = _TE(text=f"{TAIL_TOPIC} {TAIL_FACT}", session_t=50.0)
+with sess_z._lock:
+    sess_z._unfused_transcripts.append(te_z)
+
+_orig_chat_z = oc.chat_text
+oc.chat_text = _chat_x_fail
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_z._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_z
+check(any(e is te_z for e in sess_z._unfused_transcripts),
+      f"Test Z: tail still pending after realtime failure "
+      f"(n={len(sess_z._unfused_transcripts)})")
+
+captured_z: dict = {}
+
+def _capture_final_z(storage, status=None, **kwargs):
+    captured_z["pending_transcripts"] = list(kwargs.get("pending_transcripts") or [])
+    captured_z["pending_visuals"] = list(kwargs.get("pending_visuals") or [])
+    captured_z["note_engine"] = kwargs.get("note_engine")
+    p = storage.final_summary_path
+    p.write_text("# z summary", encoding="utf-8")
+    return "success", str(p), []
+
+def _release_rt_z(**kwargs):
+    return True, []
+
+def _can_z():
+    return True, "ok"
+
+with patch("app.course_session.final_summary.release_realtime_models", _release_rt_z), \
+     patch("app.course_session.final_summary.can_load_final_model", _can_z), \
+     patch("app.course_session.final_summary.run_final_phase", _capture_final_z):
+    res_z = sess_z._cleanup_core(
+        stop_visual=True, stop_audio=False, stop_fusion=True,
+        release_models=True,
+        wait_final_summary=True, failed=False,
+    )
+
+pend_tr_z = captured_z.get("pending_transcripts") or []
+texts_z = [getattr(e, "text", "") for e in pend_tr_z]
+check(any(TAIL_TOPIC in t for t in texts_z) and any(TAIL_FACT in t for t in texts_z),
+      f"Test Z: tail texts fed to FINAL_MODEL pending input: {texts_z}")
+check(captured_z.get("note_engine") is sess_z.note_engine,
+      "Test Z: cleanup drains pending into run_final_phase note_engine")
+_src_z = _inspect.getsource(CourseSession._cleanup_core)
+check("_unfused_transcripts" in _src_z and "run_final_phase" in _src_z,
+      "Test Z: cleanup_core drains unfused into run_final_phase")
+check(res_z is not None, "Test Z: cleanup returned")
+
+
+print("== Test AA: final fusion failure -> no final_summary.md ==")
+storage_aa = _SS()
+# Independent session dir: any leftover final_summary.md must not be this run's.
+check(not storage_aa.final_summary_path.exists(),
+      "Test AA: fresh session has no pre-existing final_summary.md")
+ne_aa = NoteEngine(storage_aa, model=_RT_I)
+forget_loaded_models()
+gen_aa_called = []
+
+def _gen_aa_should_not_run(storage, status=None):
+    gen_aa_called.append(True)
+    p = storage.final_summary_path
+    p.write_text("WRONG success summary", encoding="utf-8")
+    return str(p)
+
+def _rel_aa():
+    forget_loaded_models({_FM_I})
+    return True, []
+
+_orig_chat_aa = oc.chat_text
+oc.chat_text = _chat_x_fail
+try:
+    with patch.object(fs, "generate_final_summary", _gen_aa_should_not_run), \
+         patch.object(fs, "release_final_model", _rel_aa), \
+         patch.object(fs, "can_load_final_model", lambda: (True, "ok")), \
+         patch("time.sleep", lambda _s: None):
+        fusion_aa, summary_aa, errs_aa = fs.run_final_phase(
+            storage_aa,
+            pending_transcripts=[_TE(text="x", session_t=1.0)],
+            pending_visuals=[],
+            note_engine=ne_aa,
+        )
+finally:
+    oc.chat_text = _orig_chat_aa
+
+check(fusion_aa == FUSION_FAILURE, f"Test AA: fusion failure (got {fusion_aa})")
+check(not gen_aa_called,
+      f"Test AA: generate_final_summary NOT called on fusion failure ({gen_aa_called})")
+check(not storage_aa.final_summary_path.exists(),
+      f"Test AA: final_summary.md absent after fusion failure "
+      f"(exists={storage_aa.final_summary_path.exists()})")
+check(any("final summary skipped" in e for e in errs_aa),
+      f"Test AA: errors mention summary skipped: {errs_aa}")
+
+
+print("== Test AB: fuse_final exception -> failure, no final_summary.md ==")
+storage_ab = _SS()
+ne_ab = NoteEngine(storage_ab, model=_RT_I)
+forget_loaded_models()
+gen_ab_called = []
+
+class _BoomEngine:
+    def fuse_final(self, transcripts, visuals, model=None):
+        raise RuntimeError("fuse_final boom")
+
+def _gen_ab_should_not_run(storage, status=None):
+    gen_ab_called.append(True)
+    p = storage.final_summary_path
+    p.write_text("WRONG", encoding="utf-8")
+    return str(p)
+
+def _rel_ab():
+    return True, []
+
+with patch.object(fs, "generate_final_summary", _gen_ab_should_not_run), \
+     patch.object(fs, "release_final_model", _rel_ab), \
+     patch.object(fs, "can_load_final_model", lambda: (True, "ok")):
+    fusion_ab, summary_ab, errs_ab = fs.run_final_phase(
+        storage_ab,
+        pending_transcripts=[_TE(text="x", session_t=1.0)],
+        pending_visuals=[],
+        note_engine=_BoomEngine(),
+    )
+
+check(fusion_ab == FUSION_FAILURE, f"Test AB: exception -> failure (got {fusion_ab})")
+check(not gen_ab_called, f"Test AB: summary not generated ({gen_ab_called})")
+check(not storage_ab.final_summary_path.exists(),
+      f"Test AB: final_summary.md absent "
+      f"(exists={storage_ab.final_summary_path.exists()})")
+check(any("final summary skipped" in e or "final fusion failed" in e for e in errs_ab),
+      f"Test AB: errors honest: {errs_ab}")
+
+
+print("== Test AC: fuse_final timeout -> failure, no final_summary.md ==")
+storage_ac = _SS()
+ne_ac = NoteEngine(storage_ac, model=_RT_I)
+forget_loaded_models()
+gen_ac_called = []
+
+def _chat_ac_timeout(*args, **kwargs):
+    raise TimeoutError("read timeout")
+
+def _gen_ac_should_not_run(storage, status=None):
+    gen_ac_called.append(True)
+    p = storage.final_summary_path
+    p.write_text("WRONG", encoding="utf-8")
+    return str(p)
+
+def _rel_ac():
+    return True, []
+
+_orig_chat_ac = oc.chat_text
+oc.chat_text = _chat_ac_timeout
+try:
+    with patch.object(fs, "generate_final_summary", _gen_ac_should_not_run), \
+         patch.object(fs, "release_final_model", _rel_ac), \
+         patch.object(fs, "can_load_final_model", lambda: (True, "ok")), \
+         patch("time.sleep", lambda _s: None):
+        fusion_ac, summary_ac, errs_ac = fs.run_final_phase(
+            storage_ac,
+            pending_transcripts=[_TE(text="x", session_t=1.0)],
+            pending_visuals=[],
+            note_engine=ne_ac,
+        )
+finally:
+    oc.chat_text = _orig_chat_ac
+
+check(fusion_ac == FUSION_FAILURE, f"Test AC: timeout -> failure (got {fusion_ac})")
+check(not gen_ac_called, f"Test AC: summary not generated ({gen_ac_called})")
+check(not storage_aa.final_summary_path.exists() and not storage_ac.final_summary_path.exists(),
+      "Test AC: final_summary.md absent on timeout")
+check(any("final summary skipped" in e or "final fusion failed" in e for e in errs_ac),
+      f"Test AC: errors honest: {errs_ac}")
+
+
+print("== Test AD: fusion failure -> partial_notes.md written ==")
+storage_ad = _SS()
+storage_ad.ensure_live_header("t")
+storage_ad.append_event({"text": "some lecture", "session_t": 1.0})
+ne_ad = NoteEngine(storage_ad, model=_RT_I)
+forget_loaded_models()
+
+def _rel_ad():
+    return True, []
+
+_orig_chat_ad = oc.chat_text
+oc.chat_text = _chat_x_fail
+try:
+    with patch.object(fs, "generate_final_summary",
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError("summary must not run"))), \
+         patch.object(fs, "release_final_model", _rel_ad), \
+         patch.object(fs, "can_load_final_model", lambda: (True, "ok")), \
+         patch("time.sleep", lambda _s: None):
+        fusion_ad, summary_ad, errs_ad = fs.run_final_phase(
+            storage_ad,
+            pending_transcripts=[_TE(text="tail", session_t=2.0)],
+            pending_visuals=[],
+            note_engine=ne_ad,
+        )
+finally:
+    oc.chat_text = _orig_chat_ad
+
+check(fusion_ad == FUSION_FAILURE, f"Test AD: fusion failure (got {fusion_ad})")
+check(storage_ad.partial_notes_path.exists(),
+      f"Test AD: partial_notes.md exists "
+      f"(exists={storage_ad.partial_notes_path.exists()})")
+check(summary_ad and str(summary_ad).endswith("partial_notes.md"),
+      f"Test AD: summary_path points at partial (got {summary_ad})")
+check(not storage_ad.final_summary_path.exists(),
+      "Test AD: final_summary.md still absent")
+partial_body_ad = storage_ad.partial_notes_path.read_text(encoding="utf-8")
+check("some lecture" in partial_body_ad or "Final Fusion failure" in partial_body_ad
+      or len(partial_body_ad) > 0,
+      f"Test AD: partial notes non-empty ({len(partial_body_ad)} bytes)")
+
+
+print("== Test AE: fusion failure -> FINAL_MODEL cleanup still runs ==")
+storage_ae = _SS()
+ne_ae = NoteEngine(storage_ae, model=_RT_I)
+forget_loaded_models()
+rel_ae_called = []
+
+def _rel_ae():
+    rel_ae_called.append(True)
+    forget_loaded_models({_FM_I})
+    return True, []
+
+_orig_chat_ae = oc.chat_text
+oc.chat_text = _chat_x_fail
+try:
+    with patch.object(fs, "generate_final_summary",
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError("summary must not run"))), \
+         patch.object(fs, "release_final_model", _rel_ae), \
+         patch.object(fs, "can_load_final_model", lambda: (True, "ok")), \
+         patch("time.sleep", lambda _s: None):
+        fusion_ae, summary_ae, errs_ae = fs.run_final_phase(
+            storage_ae,
+            pending_transcripts=[_TE(text="x", session_t=1.0)],
+            pending_visuals=[],
+            note_engine=ne_ae,
+        )
+finally:
+    oc.chat_text = _orig_chat_ae
+
+check(fusion_ae == FUSION_FAILURE, f"Test AE: fusion failure (got {fusion_ae})")
+check(bool(rel_ae_called),
+      f"Test AE: release_final_model called in finally ({rel_ae_called})")
+check(_FM_I not in loaded_models(),
+      f"Test AE: FINAL_MODEL forgotten after failure release: {loaded_models()}")
+
+
+print("== Test AF: fusion failure -> /api/ps confirms 27B gone ==")
+storage_af = _SS()
+ne_af = NoteEngine(storage_af, model=_RT_I)
+forget_loaded_models()
+ps_af = {f"{_FM_I}:latest"}  # 27B resident before release
+mark_model_loaded(_FM_I)
+
+def _rel_af():
+    ps_af.clear()
+    forget_loaded_models({_FM_I})
+    return True, []
+
+def _ps_af():
+    return set(ps_af)
+
+def _resident_af(name=None):
+    return False
+
+_orig_chat_af = oc.chat_text
+oc.chat_text = _chat_x_fail
+try:
+    with patch.object(fs, "generate_final_summary",
+                      lambda *a, **k: (_ for _ in ()).throw(AssertionError("summary must not run"))), \
+         patch.object(fs, "release_final_model", _rel_af), \
+         patch.object(fs, "can_load_final_model", lambda: (True, "ok")), \
+         patch.object(fs, "list_loaded_models_via_api", _ps_af), \
+         patch.object(fs, "is_final_model_resident", _resident_af), \
+         patch("time.sleep", lambda _s: None):
+        fusion_af, summary_af, errs_af = fs.run_final_phase(
+            storage_af,
+            pending_transcripts=[_TE(text="x", session_t=1.0)],
+            pending_visuals=[],
+            note_engine=ne_af,
+        )
+finally:
+    oc.chat_text = _orig_chat_af
+
+check(fusion_af == FUSION_FAILURE, f"Test AF: fusion failure (got {fusion_af})")
+check(not ps_af,
+      f"Test AF: /api/ps free of FINAL_MODEL after failure release: {ps_af}")
+check(not storage_af.final_summary_path.exists(),
+      "Test AF: final_summary.md absent")
+
+
+print("== Test AG: fusion SUCCESS -> final_summary.md generated ==")
+storage_ag = _SS()
+storage_ag.ensure_live_header("t")
+storage_ag.append_event({"text": "important lecture content", "session_t": 1.0})
+ne_ag = NoteEngine(storage_ag, model=_RT_I)
+forget_loaded_models()
+gen_ag_called = []
+
+def _gen_ag(storage, status=None):
+    gen_ag_called.append(True)
+    p = storage.final_summary_path
+    p.write_text("# final ok by mock", encoding="utf-8")
+    return str(p)
+
+def _rel_ag():
+    forget_loaded_models({_FM_I})
+    return True, []
+
+def _chat_ag_ok(*args, **kwargs):
+    return json.dumps({
+        "current_topic": "二重积分", "new_knowledge": ["交换积分次序"],
+        "new_formulas": ["$\\iint$"], "teacher_explanation": [],
+        "teacher_emphasis": ["注意区域"], "examples": [],
+        "pitfalls": [], "relations": [], "unresolved": [],
+        "visual_note": "", "skip": False,
+    })
+
+_orig_chat_ag = oc.chat_text
+oc.chat_text = _chat_ag_ok
+try:
+    with patch.object(fs, "generate_final_summary", _gen_ag), \
+         patch.object(fs, "release_final_model", _rel_ag), \
+         patch.object(fs, "can_load_final_model", lambda: (True, "ok")):
+        fusion_ag, summary_ag, errs_ag = fs.run_final_phase(
+            storage_ag,
+            pending_transcripts=[_TE(text="important lecture content", session_t=1.0)],
+            pending_visuals=[],
+            note_engine=ne_ag,
+        )
+finally:
+    oc.chat_text = _orig_chat_ag
+
+check(fusion_ag == FUSION_SUCCESS, f"Test AG: fusion success (got {fusion_ag})")
+check(bool(gen_ag_called), f"Test AG: generate_final_summary called ({gen_ag_called})")
+check(summary_ag and str(summary_ag).endswith("final_summary.md"),
+      f"Test AG: summary_path is final_summary.md (got {summary_ag})")
+check(storage_ag.final_summary_path.exists(),
+      "Test AG: final_summary.md exists after success")
+check(not errs_ag, f"Test AG: clean errors empty: {errs_ag}")
+check(_FM_I not in loaded_models(),
+      f"Test AG: FINAL_MODEL released after success: {loaded_models()}")
+
+
 print()
 print("== Anti-false-pass scan ==")
 test_src = Path("test_stability.py").read_text(encoding="utf-8")

@@ -397,8 +397,22 @@ def run_final_phase(
                 else:
                     _st(f"Final Fusion 完成: {fusion_status}")
 
-        # --- Final Summary (always attempted when we got this far) ---
-        # Re-check gate immediately before loading FINAL_MODEL for summary.
+        # Round 6: FAILURE must NOT generate a full final_summary.md.
+        # SUCCESS / NO-OP may proceed to summary. Cleanup still runs in finally.
+        if fusion_status == "failure":
+            errors.append("final summary skipped: final fusion failure")
+            try:
+                storage.write_partial_notes(
+                    reason="Final Fusion failure — full final_summary.md skipped"
+                )
+                summary_path = str(storage.partial_notes_path)
+                _st(f"partial_notes.md 已写入（因 Final Fusion 失败）: {summary_path}")
+            except Exception as e:
+                errors.append(f"partial notes write failed: {e}")
+                log.error("partial notes after fusion failure", exc_info=True)
+            return fusion_status, summary_path, errors
+
+        # --- Final Summary (only after SUCCESS or NO-OP) ---
         allowed, reason = can_load_final_model()
         if not allowed:
             errors.append(f"ps gate before summary: {reason}")

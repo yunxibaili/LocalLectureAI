@@ -287,28 +287,36 @@ class CourseSession:
     def _fuse_once(self) -> None:
         """Realtime fusion tick: recent events -> incremental state update.
 
-        Round 4: only mark_model_loaded when fuse() returns True (success).
-        Never registers FINAL_MODEL here — realtime uses REALTIME_FUSION_MODEL.
+        Round 6: snapshot pending, call fuse, consume ONLY on success.
+        Failure keeps pending so Final Fusion can catch the tail.
+        Never registers FINAL_MODEL here.
         """
         with self._lock:
             if not self._unfused_transcripts and not self._unfused_visuals:
                 return
-            tr = self._unfused_transcripts[:]
-            vi = self._unfused_visuals[:]
-            self._unfused_transcripts.clear()
-            self._unfused_visuals.clear()
+            tr = list(self._unfused_transcripts)
+            vi = list(self._unfused_visuals)
 
         updated = self.note_engine.fuse(tr, vi)
         if updated:
-            # fuse() only returns True after applying a real delta.
-            # False (skip/failure) must never mark_model_loaded (Round 5).
+            # Consume only events in this snapshot (identity), not new arrivals.
+            with self._lock:
+                self._unfused_transcripts = [
+                    e for e in self._unfused_transcripts
+                    if not any(e is x for x in tr)
+                ]
+                self._unfused_visuals = [
+                    e for e in self._unfused_visuals
+                    if not any(e is x for x in vi)
+                ]
             mark_model_loaded(self.note_engine.model)
+        # failure/skip: leave pending intact for Final Fusion
         st = self.note_engine.state
         self._status(
             f"增量笔记 #{st.updates}: 主题={st.current_topic or '-'} "
             f"概念={len(st.current_concepts)} 公式={len(st.formulas)} "
             f"强调={len(st.teacher_emphasis)}"
-            + ("" if updated else "（skip/失败）")
+            + ("" if updated else "（skip/失败，pending 保留）")
         )
 
     # ------------------------------------------------------------------
@@ -488,7 +496,6 @@ class CourseSession:
                     msg = "; ".join(final_errs)
                     stop_error = (stop_error + "; " if stop_error else "") + msg
                     self.last_error = self.last_error or msg
-                    # fusion/summary failure or final-model release failure
                     if any(
                         "release" in e.lower()
                         or "resident" in e.lower()
@@ -498,8 +505,18 @@ class CourseSession:
                         cleanup_status = CleanupStatus.CLEANUP_FAILED
                     if fusion_status == "failure":
                         log.error("final fusion failed: %s", msg)
-                    if summary_path:
-                        self._status(f"完成(部分): {summary_path}")
+                        # Ensure partial artifact exists even if run_final_phase
+                        # could not write it (e.g. exception path).
+                        if not self.storage.partial_notes_path.exists():
+                            try:
+                                p = self.storage.write_partial_notes(reason=msg)
+                                summary_path = str(p)
+                            except Exception:
+                                log.error("partial after fusion failure", exc_info=True)
+                    if summary_path and str(summary_path).endswith("final_summary.md"):
+                        self._status(f"完成: {summary_path}")
+                    elif summary_path:
+                        self._status(f"部分完成: {summary_path}")
                     else:
                         self._status(f"课后阶段失败: {msg}")
                 elif summary_path:
@@ -553,11 +570,11 @@ class CourseSession:
                 and cleanup_status == CleanupStatus.CLEANUP_OK
             )
             if wait_final_summary:
+                # final_summary.md only counts on fusion SUCCESS / NO-OP path.
                 success = success and summary_path is not None and (
                     self.storage.final_summary_path.exists()
                     or (summary_path and str(summary_path).endswith("final_summary.md"))
                 )
-                # Final Fusion failure never counts as full success.
                 if fusion_status == "failure":
                     success = False
             elif summary_path:
