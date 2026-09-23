@@ -53,6 +53,9 @@ WORKER_JOIN_TIMEOUT = REQUEST_TIMEOUT + CLEANUP_GRACE
 # headroom (default 4096 truncated content -> empty replies). Verified locally.
 NUM_CTX_LIVE = int(_env("NUM_CTX_LIVE", "8192"))
 NUM_CTX_FINAL = int(_env("NUM_CTX_FINAL", "16384"))
+# Round 13: realtime delta JSON is small; 6144 let thinking burn the budget
+# (done_reason=length, empty content). 2048 is enough for a full delta.
+REALTIME_FUSION_NUM_PREDICT = int(_env("REALTIME_FUSION_NUM_PREDICT", "2048"))
 
 # Retry/unload verification tuning
 UNLOAD_RETRY_COUNT = int(_env("UNLOAD_RETRY_COUNT", "3"))

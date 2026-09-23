@@ -20,6 +20,8 @@ from .events import TranscriptEvent, VisualEvent
 from .note_engine import NoteEngine
 from .settings import (
     FUSION_INTERVAL_S,
+    RECENT_TRANSCRIPT_EVENTS,
+    RECENT_VISUAL_EVENTS,
     WORKER_JOIN_TIMEOUT,
     CleanupStatus,
     mark_model_loaded,
@@ -310,17 +312,25 @@ class CourseSession:
         Round 12: write one structured line to realtime_fusion_status.jsonl
         per attempt (always on). Never sets SessionState.FAILED and never
         stops capture on fusion failure/skip/exception.
+
+        Round 13: fuse/consume only the prompt window (last RECENT_* events);
+        older pending stay for later ticks / Final Fusion. Success identity-
+        consumes only that window, never the full backlog.
         """
         with self._lock:
             if not self._unfused_transcripts and not self._unfused_visuals:
                 # No pending: nothing to fuse. Absence of a status line
                 # means "no pending", not "silently failing".
                 return
-            tr = list(self._unfused_transcripts)
-            vi = list(self._unfused_visuals)
+            # Full pending counts = backlog evidence. Window = what the model
+            # actually sees (matches NoteEngine last-RECENT_* slicing).
+            pending_tr = len(self._unfused_transcripts)
+            pending_vi = len(self._unfused_visuals)
+            tr = list(self._unfused_transcripts[-RECENT_TRANSCRIPT_EVENTS:])
+            vi = list(self._unfused_visuals[-RECENT_VISUAL_EVENTS:])
+            fused_tr = len(tr)
+            fused_vi = len(vi)
 
-        pending_tr = len(tr)
-        pending_vi = len(vi)
         self._fuse_attempt_id += 1
         attempt_id = self._fuse_attempt_id
         t0 = time.monotonic()
@@ -341,7 +351,8 @@ class CourseSession:
         latency_ms = int((time.monotonic() - t0) * 1000)
 
         if updated:
-            # Consume only events in this snapshot (identity), not new arrivals.
+            # Round 13: consume ONLY the prompt-window identities. Backlog
+            # older than RECENT_* stays pending for later ticks / Final Fusion.
             with self._lock:
                 self._unfused_transcripts = [
                     e for e in self._unfused_transcripts
@@ -367,6 +378,8 @@ class CourseSession:
             len(getattr(e, "text", "") or "") for e in tr
         ) + sum(len(getattr(e, "text", "") or "") for e in vi)
 
+        # Round 12 status keys + Round 13 diagnostic sizes. Status stays
+        # privacy-safe: counts/chars/enum only, never full prompt/response.
         record = {
             "timestamp": time.time(),
             "attempt_id": attempt_id,
@@ -377,6 +390,15 @@ class CourseSession:
             "latency_ms": latency_ms,
             "exception_type": exception_type,
             "error_message": error_message,
+            "model": str(nf.get("model") or self.note_engine.model or ""),
+            "prompt_chars": int(nf.get("prompt_chars") or 0),
+            "transcript_chars": int(nf.get("transcript_chars") or 0),
+            "visual_chars": int(nf.get("visual_chars") or 0),
+            "response_chars": int(nf.get("response_chars") or 0),
+            "parse_stage": nf.get("parse_stage"),
+            "http_status": nf.get("http_status"),
+            "fused_transcript_count": fused_tr,
+            "fused_visual_count": fused_vi,
         }
         self._write_fusion_status(record)
 

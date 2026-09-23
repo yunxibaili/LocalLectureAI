@@ -82,17 +82,35 @@ FUSION_SYSTEM = """你是中文网课的实时课程笔记引擎。
 若本段没有任何有学习价值的新信息（比如纯寒暄），输出 {"skip": true}，其余字段为空。"""
 
 
+def _cap_join(items, limit: int = 40, max_chars: int = 2400) -> str:
+    """Cap CourseState history embedded in the realtime fusion prompt.
+
+    Round 13: unbounded lists grew with the class and pushed num_predict
+    into thinking-only length truncation.
+    """
+    seq = [str(x) for x in (items or []) if str(x).strip()]
+    if len(seq) > limit:
+        seq = seq[:limit]
+    s = "; ".join(seq)
+    if len(s) > max_chars:
+        s = s[: max_chars - 1] + "…"
+    return s
+
+
 def build_fusion_prompt(
     state_dict: dict,
     transcript_lines: list[str],
     visual_lines: list[str],
 ) -> str:
+    topic = str(state_dict.get("current_topic") or "")
+    if len(topic) > 200:
+        topic = topic[:199] + "…"
     state_str = (
-        f"当前主题: {state_dict.get('current_topic', '')}\n"
-        f"已有概念: {'; '.join(state_dict.get('current_concepts', []))}\n"
-        f"已有公式: {'; '.join(state_dict.get('formulas', []))}\n"
-        f"已有强调: {'; '.join(state_dict.get('teacher_emphasis', []))}\n"
-        f"未解决: {'; '.join(state_dict.get('unresolved_points', []))}"
+        f"当前主题: {topic}\n"
+        f"已有概念: {_cap_join(state_dict.get('current_concepts'))}\n"
+        f"已有公式: {_cap_join(state_dict.get('formulas'))}\n"
+        f"已有强调: {_cap_join(state_dict.get('teacher_emphasis'))}\n"
+        f"未解决: {_cap_join(state_dict.get('unresolved_points'), limit=20, max_chars=800)}"
     )
     tr = "\n".join(transcript_lines) if transcript_lines else "（本段无新转写）"
     vi = "\n".join(visual_lines) if visual_lines else "（本段无画面变化）"

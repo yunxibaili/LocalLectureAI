@@ -505,20 +505,19 @@ print("== Test E: fuse() returns False -> no mark_model_loaded ==")
 from app.course_session.note_engine import NoteEngine  # noqa: E402
 from app.course_session.storage import SessionStorage as _SS  # noqa: E402
 from app.course_session.events import TranscriptEvent as _TE  # noqa: E402
+from app.course_session import note_engine as note_engine_mod  # noqa: E402
 
 storage_e = _SS()
 ne = NoteEngine(storage_e, model="fake-fusion-test")
 forget_loaded_models()
 
-# Monkeypatch chat_text to return invalid JSON
-import core.ollama_client as oc  # noqa: E402
+# Round 13: fuse() realtime path calls note_engine.chat_fusion (not chat_text).
+_orig_fusion_e = note_engine_mod.chat_fusion
 
-_orig_chat_text = oc.chat_text
-
-def _fake_chat_text_bad(*args, **kwargs):
+def _fake_fusion_e_bad(*args, **kwargs):
     return "not valid json at all {{{"
 
-oc.chat_text = _fake_chat_text_bad
+note_engine_mod.chat_fusion = _fake_fusion_e_bad
 try:
     tr = [_TE(text="hello", session_t=1.0)]
     updated = ne.fuse(tr, [])
@@ -526,8 +525,7 @@ try:
     check("fake-fusion-test" not in loaded_models(),
           f"Test E: model NOT registered on invalid response: {loaded_models()}")
 finally:
-    oc.chat_text = _orig_chat_text
-
+    note_engine_mod.chat_fusion = _orig_fusion_e
 
 print("== Test F: audio fatal -> visual/fusion stopped (via _cleanup_core) ==")
 # Construct a CourseSession with fake visual/fusion that record stop calls
@@ -790,12 +788,12 @@ sess_m.note_engine = NoteEngine(storage_m, model="fake-realtime-not-marked")
 sess_m.storage.ensure_live_header("t")
 forget_loaded_models()
 
-_orig_chat2 = oc.chat_text
+_orig_chat2 = note_engine_mod.chat_fusion
 
 def _fake_chat_false(*args, **kwargs):
     return "not json {{{"
 
-oc.chat_text = _fake_chat_false
+note_engine_mod.chat_fusion = _fake_chat_false
 try:
     from app.course_session.events import TranscriptEvent as _TE2
     with sess_m._lock:
@@ -806,7 +804,7 @@ try:
     check(sess_m.note_engine.state.updates == 0,
           f"Test M: no state update on failed fuse (updates={sess_m.note_engine.state.updates})")
 finally:
-    oc.chat_text = _orig_chat2
+    note_engine_mod.chat_fusion = _orig_chat2
     forget_loaded_models()
 
 
@@ -980,6 +978,7 @@ check("FINAL_MODEL=qwen38-27b-main:latest" in roles, f"Test: roles print FINAL 2
 
 print()
 print("== Test Q: Final Fusion executes on pending events (FINAL_MODEL) ==")
+import core.ollama_client as oc  # noqa: E402 (final fusion still patches QLens chat_text)
 from app.course_session.note_engine import (  # noqa: E402
     FUSION_FAILURE,
     FUSION_NOOP,
@@ -1246,12 +1245,12 @@ forget_loaded_models()
 def _chat_skip(*args, **kwargs):
     return json.dumps({"skip": True, "current_topic": ""})
 
-_orig_chat_w = oc.chat_text
-oc.chat_text = _chat_skip
+_orig_chat_w = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_skip
 try:
     updated_w = ne_w.fuse([_TE(text="hello", session_t=1.0)], [])
 finally:
-    oc.chat_text = _orig_chat_w
+    note_engine_mod.chat_fusion = _orig_chat_w
 check(updated_w is False, f"Test W: skip returns False (got {updated_w})")
 check("fake-rt-registry" not in loaded_models(),
       f"Test W: skip=True does NOT mark_model_loaded: {loaded_models()}")
@@ -1264,11 +1263,11 @@ def _chat_ok_w(*args, **kwargs):
         "visual_note": "", "skip": False,
     })
 
-oc.chat_text = _chat_ok_w
+note_engine_mod.chat_fusion = _chat_ok_w
 try:
     updated_w2 = ne_w.fuse([_TE(text="real info", session_t=2.0)], [])
 finally:
-    oc.chat_text = _orig_chat_w
+    note_engine_mod.chat_fusion = _orig_chat_w
 check(updated_w2 is True, f"Test W: success returns True (got {updated_w2})")
 check("fake-rt-registry" in loaded_models(),
       f"Test W: success marks realtime model: {loaded_models()}")
@@ -1277,11 +1276,12 @@ check("fake-rt-registry" in loaded_models(),
 storage_w2 = _SS()
 ne_w2 = NoteEngine(storage_w2, model="fake-rt-registry")
 forget_loaded_models()
+_oc_final_w = oc.chat_text
 oc.chat_text = _chat_ok_w
 try:
     st_w2 = ne_w2.fuse_final([_TE(text="final", session_t=3.0)], [], model=_FM_I)
 finally:
-    oc.chat_text = _orig_chat_w
+    oc.chat_text = _oc_final_w
 check(st_w2 == FUSION_SUCCESS, f"Test W: final fusion success (got {st_w2})")
 check(_FM_I in loaded_models() and "fake-rt-registry" not in loaded_models(),
       f"Test W: final registry only FINAL_MODEL: {loaded_models()}")
@@ -1345,13 +1345,13 @@ with sess_x._lock:
 def _chat_x_fail(*args, **kwargs):
     return "not json {{{"
 
-_orig_chat_x = oc.chat_text
-oc.chat_text = _chat_x_fail
+_orig_chat_x = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_x_fail
 try:
     with patch("time.sleep", lambda _s: None):
         sess_x._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_x
+    note_engine_mod.chat_fusion = _orig_chat_x
 
 check(len(sess_x._unfused_transcripts) == 1
       and any(e is te_x for e in sess_x._unfused_transcripts),
@@ -1392,12 +1392,12 @@ def _chat_y_ok(*args, **kwargs):
         "visual_note": "", "skip": False,
     })
 
-_orig_chat_y = oc.chat_text
-oc.chat_text = _chat_y_ok
+_orig_chat_y = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_y_ok
 try:
     sess_y._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_y
+    note_engine_mod.chat_fusion = _orig_chat_y
 
 check(not any(e is te_a for e in sess_y._unfused_transcripts),
       f"Test Y: snapshot batch consumed on success (n={len(sess_y._unfused_transcripts)})")
@@ -1424,13 +1424,13 @@ te_z = _TE(text=f"{TAIL_TOPIC} {TAIL_FACT}", session_t=50.0)
 with sess_z._lock:
     sess_z._unfused_transcripts.append(te_z)
 
-_orig_chat_z = oc.chat_text
-oc.chat_text = _chat_x_fail
+_orig_chat_z = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_x_fail
 try:
     with patch("time.sleep", lambda _s: None):
         sess_z._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_z
+    note_engine_mod.chat_fusion = _orig_chat_z
 check(any(e is te_z for e in sess_z._unfused_transcripts),
       f"Test Z: tail still pending after realtime failure "
       f"(n={len(sess_z._unfused_transcripts)})")
@@ -1806,6 +1806,7 @@ check(calls_ah and isinstance(calls_ah[0].get("timeout"), int)
 # =====================================================================
 # ROUND 12: realtime fusion structured diagnostics + pending preservation
 # =====================================================================
+from app.course_session import note_engine as note_engine_mod  # noqa: E402
 from app.course_session.note_engine import (  # noqa: E402
     FUSE_EMPTY,
     FUSE_EXCEPTION,
@@ -1816,6 +1817,10 @@ from app.course_session.note_engine import (  # noqa: E402
     FUSE_TIMEOUT,
 )
 from app.course_session.session import SessionState as _SSState  # noqa: E402
+from app.course_session.settings import (  # noqa: E402
+    RECENT_TRANSCRIPT_EVENTS,
+    RECENT_VISUAL_EVENTS,
+)
 
 _REQUIRED_STATUS_KEYS = (
     "timestamp",
@@ -1827,6 +1832,16 @@ _REQUIRED_STATUS_KEYS = (
     "latency_ms",
     "exception_type",
     "error_message",
+    # Round 13 diagnostic extensions (still size/enum only).
+    "model",
+    "prompt_chars",
+    "transcript_chars",
+    "visual_chars",
+    "response_chars",
+    "parse_stage",
+    "http_status",
+    "fused_transcript_count",
+    "fused_visual_count",
 )
 
 
@@ -1865,13 +1880,13 @@ def _chat_delta_ok(*args, **kwargs):
 print("== Test AI: invalid JSON -> status invalid_json, pending kept ==")
 sess_ai, te_ai = _status_sess("fake-rt-ai")
 forget_loaded_models()
-_orig_chat_ai = oc.chat_text
-oc.chat_text = lambda *a, **k: "not json {{{"
+_orig_chat_ai = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = lambda *a, **k: "not json {{{"
 try:
     with patch("time.sleep", lambda _s: None):
         sess_ai._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_ai
+    note_engine_mod.chat_fusion = _orig_chat_ai
 check(any(e is te_ai for e in sess_ai._unfused_transcripts),
       f"Test AI: pending kept on invalid_json (n={len(sess_ai._unfused_transcripts)})")
 _ai_lines = _read_status_lines(sess_ai.storage.realtime_fusion_status_path)
@@ -1898,13 +1913,13 @@ class _Boom(Exception):
 def _chat_aj_boom(*a, **k):
     raise _Boom("fusion boom")
 
-_orig_chat_aj = oc.chat_text
-oc.chat_text = _chat_aj_boom
+_orig_chat_aj = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_aj_boom
 try:
     with patch("time.sleep", lambda _s: None):
         sess_aj._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_aj
+    note_engine_mod.chat_fusion = _orig_chat_aj
 check(any(e is te_aj for e in sess_aj._unfused_transcripts),
       f"Test AJ: pending kept on exception (n={len(sess_aj._unfused_transcripts)})")
 _aj_lines = _read_status_lines(sess_aj.storage.realtime_fusion_status_path)
@@ -1929,13 +1944,13 @@ class _ReadTimeout(Exception):
 def _chat_ak_timeout(*a, **k):
     raise _ReadTimeout("Read timed out waiting for token")
 
-_orig_chat_ak = oc.chat_text
-oc.chat_text = _chat_ak_timeout
+_orig_chat_ak = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_ak_timeout
 try:
     with patch("time.sleep", lambda _s: None):
         sess_ak._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_ak
+    note_engine_mod.chat_fusion = _orig_chat_ak
 check(any(e is te_ak for e in sess_ak._unfused_transcripts),
       f"Test AK: pending kept on timeout (n={len(sess_ak._unfused_transcripts)})")
 _ak_lines = _read_status_lines(sess_ak.storage.realtime_fusion_status_path)
@@ -1950,13 +1965,13 @@ print("== Test AL: fuse returns False (failure) -> status failure, pending kept 
 sess_al, te_al = _status_sess("fake-rt-al")
 forget_loaded_models()
 # Empty chat responses after retries: _chat_fusion returns None without raising.
-_orig_chat_al = oc.chat_text
-oc.chat_text = lambda *a, **k: ""
+_orig_chat_al = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = lambda *a, **k: ""
 try:
     with patch("time.sleep", lambda _s: None):
         sess_al._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_al
+    note_engine_mod.chat_fusion = _orig_chat_al
 check(any(e is te_al for e in sess_al._unfused_transcripts),
       f"Test AL: pending kept when fuse=False (n={len(sess_al._unfused_transcripts)})")
 _al_lines = _read_status_lines(sess_al.storage.realtime_fusion_status_path)
@@ -1970,12 +1985,12 @@ forget_loaded_models()
 print("== Test AM: skip=True -> status skip, pending kept ==")
 sess_am, te_am = _status_sess("fake-rt-am")
 forget_loaded_models()
-_orig_chat_am = oc.chat_text
-oc.chat_text = lambda *a, **k: json.dumps({"skip": True, "current_topic": ""})
+_orig_chat_am = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = lambda *a, **k: json.dumps({"skip": True, "current_topic": ""})
 try:
     sess_am._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_am
+    note_engine_mod.chat_fusion = _orig_chat_am
 check(any(e is te_am for e in sess_am._unfused_transcripts),
       f"Test AM: pending kept on skip (n={len(sess_am._unfused_transcripts)})")
 _am_lines = _read_status_lines(sess_am.storage.realtime_fusion_status_path)
@@ -2001,12 +2016,12 @@ def _chat_an_ok(*a, **k):
         sess_an._unfused_transcripts.append(te_an_b)
     return _chat_delta_ok()
 
-_orig_chat_an = oc.chat_text
-oc.chat_text = _chat_an_ok
+_orig_chat_an = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_an_ok
 try:
     sess_an._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_an
+    note_engine_mod.chat_fusion = _orig_chat_an
 check(not any(e is te_an_a for e in sess_an._unfused_transcripts),
       f"Test AN: snapshot consumed (n={len(sess_an._unfused_transcripts)})")
 check(any(e is te_an_b for e in sess_an._unfused_transcripts),
@@ -2034,14 +2049,14 @@ sess_ao.visual = _OrderVisual()
 forget_loaded_models()
 with sess_ao._lock:
     sess_ao._unfused_transcripts.append(_TE(text="pend_ao", session_t=1.0))
-_orig_chat_ao = oc.chat_text
-oc.chat_text = lambda *a, **k: "broken {{{"
+_orig_chat_ao = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = lambda *a, **k: "broken {{{"
 try:
     with patch("time.sleep", lambda _s: None):
         sess_ao._fuse_once()
         sess_ao._fuse_once()  # second failure must not escalate lifecycle
 finally:
-    oc.chat_text = _orig_chat_ao
+    note_engine_mod.chat_fusion = _orig_chat_ao
 check(sess_ao.state == _SSState.RUNNING,
       f"Test AO: state stays RUNNING (got {sess_ao.state})")
 check(sess_ao.running is True, "Test AO: running stays True after fusion failures")
@@ -2066,13 +2081,13 @@ def _chat_ap_leaky(*a, **k):
     # for exceptions; invalid_json uses a fixed short message).
     return "LEAK_PROMPT_AND_RESPONSE_" + ("X" * 5000)
 
-_orig_chat_ap = oc.chat_text
-oc.chat_text = _chat_ap_leaky
+_orig_chat_ap = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_ap_leaky
 try:
     with patch("time.sleep", lambda _s: None):
         _sess_p._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_ap
+    note_engine_mod.chat_fusion = _orig_chat_ap
 _ap_raw = _sess_p.storage.realtime_fusion_status_path.read_text(encoding="utf-8")
 check("SECRET_COURSE_TEXT_MARKER_123" not in _ap_raw,
       "Test AP: no transcript text in status file")
@@ -2115,12 +2130,12 @@ check(_aq_lines and _aq_lines[0].get("exception_type") == "RuntimeError",
       f"Test AQ: exception_type RuntimeError (got {_aq_lines and _aq_lines[0].get('exception_type')})")
 # After recovery, a successful fuse still works and drains snapshot.
 sess_aq.note_engine.fuse = _orig_fuse_aq
-_orig_chat_aq = oc.chat_text
-oc.chat_text = _chat_delta_ok
+_orig_chat_aq = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_delta_ok
 try:
     sess_aq._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_aq
+    note_engine_mod.chat_fusion = _orig_chat_aq
 check(len(sess_aq._unfused_transcripts) == 0,
       f"Test AQ: recovered success drains pending (n={len(sess_aq._unfused_transcripts)})")
 _aq_lines2 = _read_status_lines(sess_aq.storage.realtime_fusion_status_path)
@@ -2134,14 +2149,14 @@ _storage_ar = _SS()
 _ne_ar = NoteEngine(_storage_ar, model="fake-rt-ar")
 forget_loaded_models()
 
-_orig_chat_ar = oc.chat_text
+_orig_chat_ar = note_engine_mod.chat_fusion
 # empty input -> FUSE_EMPTY, no chat call
 _r_ar = _ne_ar.fuse([], [])
 check(_r_ar is False and _ne_ar.last_fuse.get("result") == FUSE_EMPTY,
       f"Test AR: empty input -> empty (got {_ne_ar.last_fuse})")
 
 # invalid json
-oc.chat_text = lambda *a, **k: "nope"
+note_engine_mod.chat_fusion = lambda *a, **k: "nope"
 try:
     with patch("time.sleep", lambda _s: None):
         _r_ar2 = _ne_ar.fuse([_TE(text="x", session_t=1.0)], [])
@@ -2151,13 +2166,13 @@ check(_r_ar2 is False and _ne_ar.last_fuse.get("result") == FUSE_INVALID_JSON,
       f"Test AR: invalid_json (got {_ne_ar.last_fuse.get('result')})")
 
 # skip
-oc.chat_text = lambda *a, **k: json.dumps({"skip": True})
+note_engine_mod.chat_fusion = lambda *a, **k: json.dumps({"skip": True})
 _r_ar3 = _ne_ar.fuse([_TE(text="x", session_t=1.0)], [])
 check(_r_ar3 is False and _ne_ar.last_fuse.get("result") == FUSE_SKIP,
       f"Test AR: skip (got {_ne_ar.last_fuse.get('result')})")
 
 # success
-oc.chat_text = _chat_delta_ok
+note_engine_mod.chat_fusion = _chat_delta_ok
 _r_ar4 = _ne_ar.fuse([_TE(text="real", session_t=2.0)], [])
 check(_r_ar4 is True and _ne_ar.last_fuse.get("result") == FUSE_OK,
       f"Test AR: success (got {_ne_ar.last_fuse.get('result')})")
@@ -2167,12 +2182,12 @@ check(_ne_ar.last_fuse.get("input_chars", 0) > 0,
 # exception inside fuse outer path is still classified
 def _chat_ar_raise(*a, **k):
     raise ValueError("chat path fail")
-oc.chat_text = _chat_ar_raise
+note_engine_mod.chat_fusion = _chat_ar_raise
 try:
     with patch("time.sleep", lambda _s: None):
         _ne_ar.fuse([_TE(text="y", session_t=3.0)], [])
 finally:
-    oc.chat_text = _orig_chat_ar
+    note_engine_mod.chat_fusion = _orig_chat_ar
 check(_ne_ar.last_fuse.get("result") == FUSE_EXCEPTION
       and _ne_ar.last_fuse.get("exception_type") == "ValueError",
       f"Test AR: chat exception classified (got {_ne_ar.last_fuse})")
@@ -2193,13 +2208,13 @@ sess_at.note_engine = NoteEngine(sess_at.storage, model="fake-rt-at")
 te_at = _TE(text=f"{TAIL_AT} core_fact", session_t=50.0)
 with sess_at._lock:
     sess_at._unfused_transcripts.append(te_at)
-_orig_chat_at = oc.chat_text
-oc.chat_text = lambda *a, **k: "not json {{{"
+_orig_chat_at = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = lambda *a, **k: "not json {{{"
 try:
     with patch("time.sleep", lambda _s: None):
         sess_at._fuse_once()
 finally:
-    oc.chat_text = _orig_chat_at
+    note_engine_mod.chat_fusion = _orig_chat_at
 check(any(e is te_at for e in sess_at._unfused_transcripts),
       f"Test AT: tail still pending after realtime failure (n={len(sess_at._unfused_transcripts)})")
 check(sess_at.state == _SSState.RUNNING,
@@ -2242,6 +2257,196 @@ check(sess_at.storage.final_summary_path.exists(),
       "Test AT: final_summary written after realtime failure")
 check(res_at is not None and getattr(res_at, "success", None) is True,
       f"Test AT: stop succeeded after realtime failures (got {res_at})")
+
+
+# =====================================================================
+# ROUND 13: realtime fusion root-cause fix (format=json + thinking harvest
+# + window consume + diagnostics) — recovery / window / diag / parse tests
+# =====================================================================
+print("== Test AU: timeout -> invalid_json -> success recovery (pending kept until success) ==")
+sess_au, te_au = _status_sess("fake-rt-au")
+forget_loaded_models()
+_au_calls = {"n": 0}
+
+def _chat_au_seq(*args, **kwargs):
+    # chat_fusion may be invoked twice per fuse() on non-JSON retry.
+    # Map: first call timeout; next two invalid; then success.
+    _au_calls["n"] += 1
+    if _au_calls["n"] == 1:
+        class _ReadTimeout(Exception):
+            pass
+        raise _ReadTimeout("Read timed out waiting for token")
+    if _au_calls["n"] <= 3:
+        return "not json {{{"
+    return _chat_delta_ok()
+
+_orig_chat_au = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = _chat_au_seq
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_au._fuse_once()  # attempt 1: timeout
+        sess_au._fuse_once()  # attempt 2: invalid_json (up to 2 retries)
+        sess_au._fuse_once()  # attempt 3: success consumes same pending
+finally:
+    note_engine_mod.chat_fusion = _orig_chat_au
+check(_au_calls["n"] >= 3, f"Test AU: at least three chat attempts (got {_au_calls['n']})")
+check(len(sess_au._unfused_transcripts) == 0,
+      f"Test AU: success consumed pending (n={len(sess_au._unfused_transcripts)})")
+_au_lines = _read_status_lines(sess_au.storage.realtime_fusion_status_path)
+check(len(_au_lines) == 3, f"Test AU: three status lines (got {len(_au_lines)})")
+check([ln.get("result") for ln in _au_lines] == [FUSE_TIMEOUT, FUSE_INVALID_JSON, FUSE_OK],
+      f"Test AU: results timeout/invalid_json/success (got {[ln.get('result') for ln in _au_lines]})")
+check(all(ln.get("pending_transcript_count") == 1 for ln in _au_lines),
+      f"Test AU: same batch pending each attempt (got {[ln.get('pending_transcript_count') for ln in _au_lines]})")
+check(all(ln.get("attempt_id") == i + 1 for i, ln in enumerate(_au_lines)),
+      f"Test AU: attempt_id 1..3 (got {[ln.get('attempt_id') for ln in _au_lines]})")
+forget_loaded_models()
+
+
+print("== Test AV: success consumes only RECENT window, not full backlog ==")
+sess_av = CourseSession(_Region(10, 10, 50, 50))
+sess_av.storage.ensure_live_header("t")
+sess_av.note_engine = NoteEngine(sess_av.storage, model="fake-rt-av")
+forget_loaded_models()
+_n_backlog = RECENT_TRANSCRIPT_EVENTS + 15
+_te_av_list = [_TE(text=f"av_{i}", session_t=float(i)) for i in range(_n_backlog)]
+with sess_av._lock:
+    sess_av._unfused_transcripts.extend(_te_av_list)
+_orig_chat_av = note_engine_mod.chat_fusion
+note_engine_mod.chat_fusion = lambda *a, **k: _chat_delta_ok()
+try:
+    sess_av._fuse_once()
+finally:
+    note_engine_mod.chat_fusion = _orig_chat_av
+_left_av = list(sess_av._unfused_transcripts)
+check(len(_left_av) == 15,
+      f"Test AV: backlog { _n_backlog } -> window {RECENT_TRANSCRIPT_EVENTS} consumed, 15 left (got {len(_left_av)})")
+check(all(any(e is t for e in _left_av) for t in _te_av_list[:-RECENT_TRANSCRIPT_EVENTS]),
+      "Test AV: oldest backlog events retained")
+check(not any(any(e is t for e in _left_av) for t in _te_av_list[-RECENT_TRANSCRIPT_EVENTS:]),
+      "Test AV: newest window events consumed")
+_av_lines = _read_status_lines(sess_av.storage.realtime_fusion_status_path)
+check(_av_lines and _av_lines[0].get("pending_transcript_count") == _n_backlog,
+      f"Test AV: status pending is full backlog (got {_av_lines and _av_lines[0].get('pending_transcript_count')})")
+check(_av_lines and _av_lines[0].get("fused_transcript_count") == RECENT_TRANSCRIPT_EVENTS,
+      f"Test AV: fused window size (got {_av_lines and _av_lines[0].get('fused_transcript_count')})")
+forget_loaded_models()
+
+
+print("== Test AW: status carries Round 13 diagnostic fields (sizes only) ==")
+_REQUIRED_R13_STATUS_KEYS = (
+    "model", "prompt_chars", "transcript_chars", "visual_chars",
+    "response_chars", "parse_stage", "http_status",
+    "fused_transcript_count", "fused_visual_count",
+)
+_sess_aw, _te_aw = _status_sess("fake-rt-aw", text="AW_SECRET_MARKER")
+forget_loaded_models()
+_orig_chat_aw = note_engine_mod.chat_fusion
+
+def _chat_aw_ok(*args, **kwargs):
+    # Simulate diag side-channel as chat_fusion would.
+    d = kwargs.get("diag")
+    if isinstance(d, dict):
+        d["http_status"] = 200
+        d["response_chars"] = 441
+        d["response_source"] = "content"
+    return _chat_delta_ok()
+
+note_engine_mod.chat_fusion = _chat_aw_ok
+try:
+    with patch("time.sleep", lambda _s: None):
+        _sess_aw._fuse_once()
+finally:
+    note_engine_mod.chat_fusion = _orig_chat_aw
+_aw_lines = _read_status_lines(_sess_aw.storage.realtime_fusion_status_path)
+check(len(_aw_lines) == 1, f"Test AW: one status line (got {len(_aw_lines)})")
+check(_aw_lines and all(k in _aw_lines[0] for k in _REQUIRED_R13_STATUS_KEYS),
+      f"Test AW: R13 keys present (got {sorted(_aw_lines[0]) if _aw_lines else []})")
+check(_aw_lines and _aw_lines[0].get("result") == FUSE_OK,
+      f"Test AW: success (got {_aw_lines and _aw_lines[0].get('result')})")
+check(_aw_lines and _aw_lines[0].get("http_status") == 200,
+      f"Test AW: http_status 200 (got {_aw_lines and _aw_lines[0].get('http_status')})")
+check(_aw_lines and _aw_lines[0].get("prompt_chars", 0) > 0,
+      f"Test AW: prompt_chars recorded (got {_aw_lines and _aw_lines[0].get('prompt_chars')})")
+check(_aw_lines and _aw_lines[0].get("parse_stage") in (
+    "direct", "fence", "brace", "escape_repaired", "brace_escape_repaired"),
+      f"Test AW: parse_stage success class (got {_aw_lines and _aw_lines[0].get('parse_stage')})")
+check(_aw_lines and isinstance(_aw_lines[0].get("response_chars"), int)
+      and _aw_lines[0].get("response_chars") > 0,
+      f"Test AW: response_chars int>0 (got {_aw_lines and _aw_lines[0].get('response_chars')})")
+_aw_raw = _sess_aw.storage.realtime_fusion_status_path.read_text(encoding="utf-8")
+check("AW_SECRET_MARKER" not in _aw_raw, "Test AW: no transcript text in status")
+check(all(k not in _aw_raw for k in ("current_topic", "teacher_explanation", "FUSION_SYSTEM")),
+      "Test AW: no prompt/response body fields in status")
+forget_loaded_models()
+
+
+print("== Test AX: parse_fusion_json fence / latex invalid-escape repair ==")
+from app.course_session.note_engine import parse_fusion_json  # noqa: E402
+_obj_ax1, _st_ax1 = parse_fusion_json('```json\n{"skip": false, "current_topic": "t"}\n```')
+check(_obj_ax1 is not None and _st_ax1 in ("direct", "fence", "brace"),
+      f"Test AX: fenced json (got {_st_ax1})")
+_obj_ax2, _st_ax2 = parse_fusion_json(r'{"current_topic": "$0 \cdot \infty$", "skip": false}')
+check(_obj_ax2 is not None and _st_ax2 in ("escape_repaired", "direct", "brace_escape_repaired", "brace"),
+      f"Test AX: latex \\cdot repaired (stage={_st_ax2}, obj={_obj_ax2 is not None})")
+_obj_ax3, _st_ax3 = parse_fusion_json("not json at all")
+check(_obj_ax3 is None and _st_ax3 == "invalid",
+      f"Test AX: invalid stage (got {_st_ax3})")
+_obj_ax4, _st_ax4 = parse_fusion_json("")
+check(_obj_ax4 is None and _st_ax4 == "empty",
+      f"Test AX: empty stage (got {_st_ax4})")
+
+
+print("== Test AY: chat_fusion harvests thinking when content empty ==")
+_sess_ay, _te_ay = _status_sess("fake-rt-ay")
+forget_loaded_models()
+
+class _FakeResp:
+    status_code = 200
+    def raise_for_status(self):
+        return None
+    def json(self):
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": json.dumps({
+                    "current_topic": "think_topic",
+                    "new_knowledge": ["k"],
+                    "skip": False,
+                }),
+            }
+        }
+
+def _post_ay(*args, **kwargs):
+    return _FakeResp()
+
+import requests as _requests_mod  # noqa: E402
+_orig_post_ay = _requests_mod.post
+_requests_mod.post = _post_ay
+try:
+    with patch("time.sleep", lambda _s: None):
+        _sess_ay._fuse_once()
+finally:
+    _requests_mod.post = _orig_post_ay
+check(len(_sess_ay._unfused_transcripts) == 0,
+      f"Test AY: thinking harvest success consumed pending (n={len(_sess_ay._unfused_transcripts)})")
+_ay_lines = _read_status_lines(_sess_ay.storage.realtime_fusion_status_path)
+check(_ay_lines and _ay_lines[0].get("result") == FUSE_OK,
+      f"Test AY: result success (got {_ay_lines and _ay_lines[0].get('result')})")
+check(_ay_lines and _ay_lines[0].get("http_status") == 200,
+      f"Test AY: http_status (got {_ay_lines and _ay_lines[0].get('http_status')})")
+forget_loaded_models()
+
+
+print("== Test AZ: fuse_final still uses QLens chat_text (FINAL path unchanged) ==")
+# Round 13 must not redirect Final Fusion off chat_text.
+_final_src = Path("app/course_session/note_engine.py").read_text(encoding="utf-8")
+check("from core.ollama_client import chat_text" in _final_src
+      and "chat_fusion(" not in _final_src.split("def fuse_final")[1].split("def _chat_fusion_final")[0],
+      "Test AZ: fuse_final body does not call chat_fusion")
+check("def _chat_fusion_final" in _final_src and "chat_text(" in _final_src,
+      "Test AZ: final path still has dedicated chat_text helper")
 
 
 print()

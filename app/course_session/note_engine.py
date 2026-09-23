@@ -2,6 +2,10 @@
 
 Round 5: fuse_final() runs post-class fusion on FINAL_MODEL without mutating
 the realtime model role. fuse() skip=True is a pure no-op (no registry mark).
+
+Round 13: realtime fuse() uses chat_fusion (Ollama format=json + thinking
+harvest) so qwen3-vl answers land in parseable JSON instead of empty content.
+fuse_final() still uses QLens chat_text on FINAL_MODEL (unchanged).
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import json
 import logging
 import re
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .events import CourseState, TranscriptEvent, VisualEvent
 from .prompts import FUSION_SYSTEM, build_fusion_prompt
@@ -18,7 +22,9 @@ from .settings import (
     FINAL_MODEL,
     NUM_CTX_FINAL,
     NUM_CTX_LIVE,
+    OLLAMA_URL,
     REALTIME_FUSION_MODEL,
+    REALTIME_FUSION_NUM_PREDICT,
     RECENT_TRANSCRIPT_EVENTS,
     RECENT_VISUAL_EVENTS,
     REQUEST_TIMEOUT,
@@ -29,6 +35,8 @@ from .storage import SessionStorage, fmt_t
 log = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+# Invalid JSON string escapes (e.g. LaTeX "\\c" from models that omit "\\").
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?![\\"bfnrtu/])')
 
 # Explicit outcomes for final fusion (never bool-only ambiguity).
 FUSION_SUCCESS = "success"
@@ -46,24 +54,106 @@ FUSE_EMPTY = "empty"
 FUSE_FAILURE = "failure"
 
 
-def _parse_json_loose(raw: str) -> Optional[dict]:
-    if not raw:
-        return None
-    s = _FENCE_RE.sub("", raw.strip()).strip()
-    try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        pass
-    # best-effort: first {...} block
-    m = re.search(r"\{.*\}", s, re.DOTALL)
+def parse_fusion_json(raw: str) -> Tuple[Optional[dict], str]:
+    """Parse one fusion model payload. Returns (dict|None, parse_stage).
+
+    Stages: empty | direct | fence | brace | escape_repaired | brace_escape_repaired | invalid.
+    Never logs or returns the full raw body.
+    """
+    if not raw or not str(raw).strip():
+        return None, "empty"
+    s = str(raw).strip()
+    candidates: List[Tuple[str, str]] = []
+    stripped = _FENCE_RE.sub("", s).strip()
+    candidates.append((stripped, "direct" if stripped == s else "fence"))
+    candidates.append((_INVALID_JSON_ESCAPE_RE.sub(r"\\\\", stripped), "escape_repaired"))
+    m = re.search(r"\{[\s\S]*\}", stripped)
     if m:
+        candidates.append((m.group(0), "brace"))
+        candidates.append((_INVALID_JSON_ESCAPE_RE.sub(r"\\\\", m.group(0)), "brace_escape_repaired"))
+    for text, stage in candidates:
+        if not text:
+            continue
         try:
-            obj = json.loads(m.group(0))
-            return obj if isinstance(obj, dict) else None
+            obj = json.loads(text)
         except Exception:
-            return None
-    return None
+            continue
+        if isinstance(obj, dict):
+            return obj, stage
+    return None, "invalid"
+
+
+def _parse_json_loose(raw: str) -> Optional[dict]:
+    obj, _stage = parse_fusion_json(raw)
+    return obj
+
+
+def chat_fusion(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    model: str,
+    temperature: float = 0.2,
+    num_ctx: int = NUM_CTX_LIVE,
+    num_predict: Optional[int] = None,
+    timeout: Optional[int] = None,
+    think: Optional[bool] = False,
+    diag: Optional[dict] = None,
+) -> str:
+    """Realtime fusion chat: Ollama format=json + content/thinking harvest.
+
+    Round 13 root cause: qwen3-vl:8b often returns the JSON only in
+    message.thinking (content empty) when format=json is used. chat_text()
+    only reads content → empty → invalid_json/failure. This helper posts
+    directly (does not modify QLens) and returns content or thinking text.
+    HTTP status and response_chars are recorded on diag when provided.
+    Full prompt/response are never stored.
+    """
+    import requests
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "options": {
+            "temperature": temperature,
+            "num_predict": int(num_predict or REALTIME_FUSION_NUM_PREDICT),
+            "num_ctx": int(num_ctx),
+        },
+    }
+    if think is not None:
+        payload["think"] = think
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=timeout if timeout is not None else REQUEST_TIMEOUT,
+        )
+    except Exception:
+        if diag is not None:
+            diag["http_status"] = None
+            diag["response_chars"] = 0
+            diag["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+        raise
+    if diag is not None:
+        diag["http_status"] = r.status_code
+        diag["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+    r.raise_for_status()
+    data = r.json()
+    msg = data.get("message") or {}
+    content = (msg.get("content") or "").strip()
+    thinking = (msg.get("thinking") or "").strip()
+    # Prefer parseable content; fall back to thinking (qwen3-vl often uses it).
+    text = content or thinking
+    if diag is not None:
+        diag["response_chars"] = len(text)
+        diag["response_source"] = "content" if content else ("thinking" if thinking else "none")
+    return text
 
 
 def _extend_unique(target: List[str], items) -> None:
@@ -91,6 +181,13 @@ class NoteEngine:
         self.last_fuse: dict = {
             "result": None,
             "input_chars": 0,
+            "prompt_chars": 0,
+            "transcript_chars": 0,
+            "visual_chars": 0,
+            "response_chars": 0,
+            "parse_stage": None,
+            "model": None,
+            "http_status": None,
             "exception_type": None,
             "error_message": None,
             "latency_ms": 0,
@@ -98,6 +195,12 @@ class NoteEngine:
         self._chat_exc_type: str | None = None
         self._chat_exc_msg: str | None = None
         self._chat_timeout: bool = False
+        self._chat_http_status: int | None = None
+        self._chat_response_chars: int = 0
+        self._chat_response_source: str | None = None
+        self._parse_stage: str | None = None
+        self._prompt_chars: int = 0
+        self._last_raw: str = ""
 
     # ------------------------------------------------------------------
     def fuse(
@@ -115,12 +218,20 @@ class NoteEngine:
         Round 12: always refreshes self.last_fuse with a structured outcome
         (success|skip|invalid_json|timeout|exception|empty|failure). Does not
         change the boolean contract or consume pending (caller owns pending).
-        """
-        from core.ollama_client import chat_text  # reuse QLens client
 
+        Round 13: realtime path uses chat_fusion (format=json + thinking
+        harvest), not QLens chat_text. fuse_final() still uses chat_text.
+        """
         diag: dict = {
             "result": FUSE_FAILURE,
             "input_chars": 0,
+            "prompt_chars": 0,
+            "transcript_chars": 0,
+            "visual_chars": 0,
+            "response_chars": 0,
+            "parse_stage": None,
+            "model": self.model,
+            "http_status": None,
             "exception_type": None,
             "error_message": None,
             "latency_ms": 0,
@@ -129,44 +240,59 @@ class NoteEngine:
         try:
             tr_lines = self._transcript_lines(transcripts)
             vi_lines = self._visual_lines(visuals)
-            diag["input_chars"] = sum(len(x) for x in tr_lines) + sum(
-                len(x) for x in vi_lines
-            )
+            diag["transcript_chars"] = sum(len(x) for x in tr_lines)
+            diag["visual_chars"] = sum(len(x) for x in vi_lines)
+            diag["input_chars"] = diag["transcript_chars"] + diag["visual_chars"]
             if not tr_lines and not vi_lines:
                 diag["result"] = FUSE_EMPTY
+                diag["parse_stage"] = "empty_input"
                 return False
 
             self._chat_exc_type = None
             self._chat_exc_msg = None
             self._chat_timeout = False
+            self._chat_http_status = None
+            self._chat_response_chars = 0
+            self._chat_response_source = None
+            self._parse_stage = None
+            self._prompt_chars = 0
+            self._last_raw = ""
             raw = self._chat_fusion(
-                chat_text,
                 tr_lines,
                 vi_lines,
                 model=self.model,
                 num_ctx=NUM_CTX_LIVE,
+                think=False,
+                timeout=REQUEST_TIMEOUT,
             )
+            diag["prompt_chars"] = self._prompt_chars
+            diag["http_status"] = self._chat_http_status
+            diag["response_chars"] = self._chat_response_chars
             if raw is None:
                 if self._chat_timeout:
                     diag["result"] = FUSE_TIMEOUT
+                    diag["parse_stage"] = "timeout"
                     diag["exception_type"] = self._chat_exc_type or "Timeout"
                     diag["error_message"] = self._chat_exc_msg
                 elif self._chat_exc_type:
                     diag["result"] = FUSE_EXCEPTION
+                    diag["parse_stage"] = "exception"
                     diag["exception_type"] = self._chat_exc_type
                     diag["error_message"] = self._chat_exc_msg
                 else:
                     diag["result"] = FUSE_FAILURE
+                    diag["parse_stage"] = "empty_response"
                     diag["error_message"] = "empty chat response"
                 return False
 
-            delta = _parse_json_loose(raw)
+            delta, stage = parse_fusion_json(raw)
+            self._parse_stage = stage
+            diag["parse_stage"] = stage
             if delta is None:
-                log.warning(
-                    "fusion response not JSON (ignored): %s", (raw or "")[:200]
-                )
+                log.warning("fusion response not JSON (ignored): stage=%s len=%d",
+                            stage, len(raw))
                 diag["result"] = FUSE_INVALID_JSON
-                diag["error_message"] = "response not JSON"
+                diag["error_message"] = f"response not JSON (stage={stage})"
                 return False
             if delta.get("skip") is True:
                 # no-op: model may have loaded, but skip must NOT register as success
@@ -186,6 +312,8 @@ class NoteEngine:
             diag["result"] = FUSE_EXCEPTION
             diag["exception_type"] = type(e).__name__
             diag["error_message"] = str(e)[:300]
+            if diag.get("parse_stage") is None:
+                diag["parse_stage"] = "exception"
             return False
         finally:
             diag["latency_ms"] = int((time.perf_counter() - t0) * 1000)
@@ -207,8 +335,6 @@ class NoteEngine:
         - Model/error → FUSION_FAILURE (no registry mark).
         Does not mutate self.model (realtime role stays REALTIME_FUSION_MODEL).
         """
-        from core.ollama_client import chat_text  # reuse QLens client
-
         target = model or FINAL_MODEL
         if not transcripts and not visuals:
             return FUSION_NOOP
@@ -218,8 +344,7 @@ class NoteEngine:
         if not tr_lines and not vi_lines:
             return FUSION_NOOP
 
-        raw = self._chat_fusion(
-            chat_text,
+        raw = self._chat_fusion_final(
             tr_lines,
             vi_lines,
             model=target,
@@ -243,6 +368,48 @@ class NoteEngine:
         self._persist_section(tr_lines, vi_lines)
         return FUSION_SUCCESS
 
+    def _chat_fusion_final(
+        self,
+        tr_lines: List[str],
+        vi_lines: List[str],
+        *,
+        model: str,
+        num_ctx: int,
+        think: Optional[bool] = None,
+        timeout: Optional[int] = None,
+    ) -> Optional[str]:
+        """Post-class chat via QLens chat_text (FINAL path; Round 13 unchanged)."""
+        from core.ollama_client import chat_text  # reuse QLens client
+
+        user = build_fusion_prompt(self.state.to_dict(), tr_lines, vi_lines)
+        raw = ""
+        self._chat_exc_type = None
+        self._chat_exc_msg = None
+        self._chat_timeout = False
+        try:
+            for attempt in range(2):
+                raw = chat_text(
+                    FUSION_SYSTEM, user, temperature=0.2, model=model,
+                    num_predict=6144, num_ctx=num_ctx,
+                    think=think, timeout=timeout,
+                )
+                if raw and _parse_json_loose(raw) is not None:
+                    return raw
+                log.warning("final fusion attempt %d not JSON; retrying", attempt + 1)
+                time.sleep(1.0)
+            return raw or None
+        except Exception as e:
+            ename = type(e).__name__
+            emsg = str(e)[:300]
+            log.error("final fusion chat_text failed: %s: %s", ename, e)
+            self._chat_exc_type = ename
+            self._chat_exc_msg = emsg
+            low = (ename + " " + emsg).lower()
+            self._chat_timeout = (
+                "timeout" in low or "timed out" in low or "readtimeout" in low
+            )
+            return None
+
     # ------------------------------------------------------------------
     def _transcript_lines(self, transcripts: List[TranscriptEvent]) -> List[str]:
         return [
@@ -259,43 +426,60 @@ class NoteEngine:
 
     def _chat_fusion(
         self,
-        chat_text,
         tr_lines: List[str],
         vi_lines: List[str],
         *,
         model: str,
         num_ctx: int,
-        think: Optional[bool] = None,
+        think: Optional[bool] = False,
         timeout: Optional[int] = None,
     ) -> Optional[str]:
         """One fusion chat with retry. Returns raw text or None on failure.
 
         Round 12: records exception type / timeout on self._chat_* for
         last_fuse diagnostics. Does not change return contract.
+        Round 13: uses chat_fusion (format=json + thinking harvest). Tests
+        patch app.course_session.note_engine.chat_fusion.
         """
         user = build_fusion_prompt(self.state.to_dict(), tr_lines, vi_lines)
+        self._prompt_chars = len(FUSION_SYSTEM) + len(user)
+        chat_diag: dict = {}
         raw = ""
         self._chat_exc_type = None
         self._chat_exc_msg = None
         self._chat_timeout = False
+        self._chat_http_status = None
+        self._chat_response_chars = 0
+        self._chat_response_source = None
         try:
             for attempt in range(2):
-                raw = chat_text(
-                    FUSION_SYSTEM, user, temperature=0.2, model=model,
-                    num_predict=6144, num_ctx=num_ctx,
+                raw = chat_fusion(
+                    FUSION_SYSTEM, user, model=model,
+                    num_predict=REALTIME_FUSION_NUM_PREDICT,
+                    num_ctx=num_ctx,
                     think=think, timeout=timeout,
+                    diag=chat_diag,
                 )
+                self._chat_http_status = chat_diag.get("http_status")
+                self._chat_response_chars = int(chat_diag.get("response_chars") or 0)
+                self._chat_response_source = chat_diag.get("response_source")
+                self._last_raw = raw or ""
                 if raw and _parse_json_loose(raw) is not None:
                     return raw
-                log.warning("fusion attempt %d not JSON; retrying", attempt + 1)
+                log.warning(
+                    "fusion attempt %d not JSON (stage=%s); retrying",
+                    attempt + 1,
+                    parse_fusion_json(raw or "")[1],
+                )
                 time.sleep(1.0)
             return raw or None
         except Exception as e:
             ename = type(e).__name__
             emsg = str(e)[:300]
-            log.error("fusion chat_text failed: %s: %s", ename, e)
+            log.error("fusion chat_fusion failed: %s: %s", ename, e)
             self._chat_exc_type = ename
             self._chat_exc_msg = emsg
+            self._chat_http_status = chat_diag.get("http_status")
             low = (ename + " " + emsg).lower()
             self._chat_timeout = (
                 "timeout" in low or "timed out" in low or "readtimeout" in low
