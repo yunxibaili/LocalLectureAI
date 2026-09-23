@@ -1770,6 +1770,39 @@ check(_FM_I not in loaded_models(),
       f"Test AG: FINAL_MODEL released after success: {loaded_models()}")
 
 
+print("== Test AH: Final Fusion uses think=False + explicit long timeout ==")
+storage_ah = _SS()
+ne_ah = NoteEngine(storage_ah, model=_RT_I)
+forget_loaded_models()
+calls_ah = []
+
+def _chat_ah(*args, **kwargs):
+    calls_ah.append(dict(kwargs))
+    return json.dumps({
+        "current_topic": "T", "new_knowledge": ["k"], "new_formulas": [],
+        "teacher_explanation": [], "teacher_emphasis": [], "examples": [],
+        "pitfalls": [], "relations": [], "unresolved": [],
+        "visual_note": "", "skip": False,
+    })
+
+_orig_chat_ah = oc.chat_text
+oc.chat_text = _chat_ah
+try:
+    st_ah = ne_ah.fuse_final(
+        [_TE(text="tail data", session_t=99.0)], [], model=_FM_I
+    )
+finally:
+    oc.chat_text = _orig_chat_ah
+    forget_loaded_models()
+
+check(st_ah == FUSION_SUCCESS, f"Test AH: final fusion success (got {st_ah})")
+check(calls_ah and calls_ah[0].get("think") is False,
+      f"Test AH: FINAL_MODEL final fusion disables thinking: {calls_ah}")
+check(calls_ah and isinstance(calls_ah[0].get("timeout"), int)
+      and calls_ah[0].get("timeout") >= 300,
+      f"Test AH: final fusion has explicit >=300s timeout: {calls_ah}")
+
+
 print()
 print("== Anti-false-pass scan ==")
 test_src = Path("test_stability.py").read_text(encoding="utf-8")

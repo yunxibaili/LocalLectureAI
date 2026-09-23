@@ -21,6 +21,7 @@ from .settings import (
     REALTIME_FUSION_MODEL,
     RECENT_TRANSCRIPT_EVENTS,
     RECENT_VISUAL_EVENTS,
+    REQUEST_TIMEOUT,
     mark_model_loaded,
 )
 from .storage import SessionStorage, fmt_t
@@ -152,6 +153,8 @@ class NoteEngine:
             vi_lines,
             model=target,
             num_ctx=NUM_CTX_FINAL,
+            think=False,
+            timeout=max(REQUEST_TIMEOUT, 300),
         )
         if raw is None:
             return FUSION_FAILURE
@@ -191,6 +194,8 @@ class NoteEngine:
         *,
         model: str,
         num_ctx: int,
+        think: Optional[bool] = None,
+        timeout: Optional[int] = None,
     ) -> Optional[str]:
         """One fusion chat with retry. Returns raw text or None on failure."""
         user = build_fusion_prompt(self.state.to_dict(), tr_lines, vi_lines)
@@ -200,6 +205,7 @@ class NoteEngine:
                 raw = chat_text(
                     FUSION_SYSTEM, user, temperature=0.2, model=model,
                     num_predict=6144, num_ctx=num_ctx,
+                    think=think, timeout=timeout,
                 )
                 if raw and _parse_json_loose(raw) is not None:
                     return raw
@@ -207,7 +213,7 @@ class NoteEngine:
                 time.sleep(1.0)
             return raw or None
         except Exception as e:
-            log.error("fusion chat_text failed: %s", e)
+            log.error("fusion chat_text failed: %s: %s", type(e).__name__, e)
             return None
 
     def _persist_section(self, tr_lines: List[str], vi_lines: List[str]) -> None:
