@@ -84,6 +84,8 @@ class CourseSession:
         self.state = SessionState.IDLE
         self._stop_result: Optional[StopResult] = None
         self._audio_failed = False
+        # Round 12: monotonic attempt id for realtime_fusion_status.jsonl.
+        self._fuse_attempt_id = 0
 
         self.audio: Optional[AudioBridge] = None
         self.visual: Optional[VisualStream] = None
@@ -294,6 +296,8 @@ class CourseSession:
             try:
                 self._fuse_once()
             except Exception:
+                # Round 12: never let one bad tick kill the fusion thread.
+                # Audio/visual/session state stay independent of fusion errors.
                 log.error("fusion loop error\n%s", traceback.format_exc())
 
     def _fuse_once(self) -> None:
@@ -302,14 +306,40 @@ class CourseSession:
         Round 6: snapshot pending, call fuse, consume ONLY on success.
         Failure keeps pending so Final Fusion can catch the tail.
         Never registers FINAL_MODEL here.
+
+        Round 12: write one structured line to realtime_fusion_status.jsonl
+        per attempt (always on). Never sets SessionState.FAILED and never
+        stops capture on fusion failure/skip/exception.
         """
         with self._lock:
             if not self._unfused_transcripts and not self._unfused_visuals:
+                # No pending: nothing to fuse. Absence of a status line
+                # means "no pending", not "silently failing".
                 return
             tr = list(self._unfused_transcripts)
             vi = list(self._unfused_visuals)
 
-        updated = self.note_engine.fuse(tr, vi)
+        pending_tr = len(tr)
+        pending_vi = len(vi)
+        self._fuse_attempt_id += 1
+        attempt_id = self._fuse_attempt_id
+        t0 = time.monotonic()
+        updated = False
+        session_exc_type: str | None = None
+        session_exc_msg: str | None = None
+
+        try:
+            updated = bool(self.note_engine.fuse(tr, vi))
+        except Exception as e:
+            # fuse() itself is not supposed to raise (Round 12); belt-and-suspenders
+            # so a coding error here still cannot drop pending or fail the session.
+            session_exc_type = type(e).__name__
+            session_exc_msg = str(e)[:300]
+            log.error("fuse raised (pending preserved)\n%s", traceback.format_exc())
+            updated = False
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
         if updated:
             # Consume only events in this snapshot (identity), not new arrivals.
             with self._lock:
@@ -323,13 +353,47 @@ class CourseSession:
                 ]
             mark_model_loaded(self.note_engine.model)
         # failure/skip: leave pending intact for Final Fusion
+
+        nf = getattr(self.note_engine, "last_fuse", None) or {}
+        if session_exc_type:
+            result = "exception"
+            exception_type = session_exc_type
+            error_message = session_exc_msg
+        else:
+            result = nf.get("result") or ("success" if updated else "failure")
+            exception_type = nf.get("exception_type")
+            error_message = nf.get("error_message")
+        input_chars = nf.get("input_chars") or sum(
+            len(getattr(e, "text", "") or "") for e in tr
+        ) + sum(len(getattr(e, "text", "") or "") for e in vi)
+
+        record = {
+            "timestamp": time.time(),
+            "attempt_id": attempt_id,
+            "pending_transcript_count": pending_tr,
+            "pending_visual_count": pending_vi,
+            "input_chars": int(input_chars),
+            "result": result,
+            "latency_ms": latency_ms,
+            "exception_type": exception_type,
+            "error_message": error_message,
+        }
+        self._write_fusion_status(record)
+
         st = self.note_engine.state
         self._status(
             f"增量笔记 #{st.updates}: 主题={st.current_topic or '-'} "
             f"概念={len(st.current_concepts)} 公式={len(st.formulas)} "
             f"强调={len(st.teacher_emphasis)}"
-            + ("" if updated else "（skip/失败，pending 保留）")
+            + ("" if updated else f"（{result}，pending 保留）")
         )
+
+    def _write_fusion_status(self, record: dict) -> None:
+        """Best-effort status append; diagnostic only — never fails fusion."""
+        try:
+            self.storage.append_realtime_fusion_status(record)
+        except Exception:
+            log.error("realtime_fusion_status write failed", exc_info=True)
 
     # ------------------------------------------------------------------
     def _lingering_workers(self) -> list[str]:

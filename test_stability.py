@@ -1803,6 +1803,447 @@ check(calls_ah and isinstance(calls_ah[0].get("timeout"), int)
       f"Test AH: final fusion has explicit >=300s timeout: {calls_ah}")
 
 
+# =====================================================================
+# ROUND 12: realtime fusion structured diagnostics + pending preservation
+# =====================================================================
+from app.course_session.note_engine import (  # noqa: E402
+    FUSE_EMPTY,
+    FUSE_EXCEPTION,
+    FUSE_FAILURE,
+    FUSE_INVALID_JSON,
+    FUSE_OK,
+    FUSE_SKIP,
+    FUSE_TIMEOUT,
+)
+from app.course_session.session import SessionState as _SSState  # noqa: E402
+
+_REQUIRED_STATUS_KEYS = (
+    "timestamp",
+    "attempt_id",
+    "pending_transcript_count",
+    "pending_visual_count",
+    "input_chars",
+    "result",
+    "latency_ms",
+    "exception_type",
+    "error_message",
+)
+
+
+def _read_status_lines(path):
+    p = Path(path)
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        out.append(json.loads(line))
+    return out
+
+
+def _status_sess(name, text="RT12_PEND"):
+    sess = CourseSession(_Region(10, 10, 50, 50))
+    sess.storage.ensure_live_header("t")
+    sess.note_engine = NoteEngine(sess.storage, model=name)
+    te = _TE(text=text, session_t=3.0)
+    with sess._lock:
+        sess._unfused_transcripts.append(te)
+    return sess, te
+
+
+def _chat_delta_ok(*args, **kwargs):
+    return json.dumps({
+        "current_topic": "T", "new_knowledge": ["k"], "new_formulas": [],
+        "teacher_explanation": [], "teacher_emphasis": [], "examples": [],
+        "pitfalls": [], "relations": [], "unresolved": [],
+        "visual_note": "", "skip": False,
+    })
+
+
+print("== Test AI: invalid JSON -> status invalid_json, pending kept ==")
+sess_ai, te_ai = _status_sess("fake-rt-ai")
+forget_loaded_models()
+_orig_chat_ai = oc.chat_text
+oc.chat_text = lambda *a, **k: "not json {{{"
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_ai._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_ai
+check(any(e is te_ai for e in sess_ai._unfused_transcripts),
+      f"Test AI: pending kept on invalid_json (n={len(sess_ai._unfused_transcripts)})")
+_ai_lines = _read_status_lines(sess_ai.storage.realtime_fusion_status_path)
+check(len(_ai_lines) == 1, f"Test AI: one status line (got {len(_ai_lines)})")
+check(_ai_lines and _ai_lines[0].get("result") == FUSE_INVALID_JSON,
+      f"Test AI: result=invalid_json (got {_ai_lines and _ai_lines[0].get('result')})")
+check(_ai_lines and all(k in _ai_lines[0] for k in _REQUIRED_STATUS_KEYS),
+      f"Test AI: required keys present (got {sorted(_ai_lines[0]) if _ai_lines else []})")
+check(_ai_lines and _ai_lines[0].get("pending_transcript_count") == 1
+      and _ai_lines[0].get("pending_visual_count") == 0,
+      f"Test AI: pending counts (got {_ai_lines[0] if _ai_lines else None})")
+check("fake-rt-ai" not in loaded_models(),
+      f"Test AI: no registry mark (got {loaded_models()})")
+forget_loaded_models()
+
+
+print("== Test AJ: chat exception -> status exception + type, pending kept ==")
+sess_aj, te_aj = _status_sess("fake-rt-aj")
+forget_loaded_models()
+
+class _Boom(Exception):
+    pass
+
+def _chat_aj_boom(*a, **k):
+    raise _Boom("fusion boom")
+
+_orig_chat_aj = oc.chat_text
+oc.chat_text = _chat_aj_boom
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_aj._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_aj
+check(any(e is te_aj for e in sess_aj._unfused_transcripts),
+      f"Test AJ: pending kept on exception (n={len(sess_aj._unfused_transcripts)})")
+_aj_lines = _read_status_lines(sess_aj.storage.realtime_fusion_status_path)
+check(len(_aj_lines) == 1 and _aj_lines[0].get("result") == FUSE_EXCEPTION,
+      f"Test AJ: result=exception (got {_aj_lines and _aj_lines[0].get('result')})")
+check(_aj_lines and _aj_lines[0].get("exception_type") == "_Boom",
+      f"Test AJ: exception_type=_Boom (got {_aj_lines and _aj_lines[0].get('exception_type')})")
+check(_aj_lines and "fusion boom" in (_aj_lines[0].get("error_message") or ""),
+      f"Test AJ: error_message carries message (got {_aj_lines and _aj_lines[0].get('error_message')})")
+check(sess_aj.state != _SSState.FAILED,
+      f"Test AJ: session not FAILED after fusion exception (state={sess_aj.state})")
+forget_loaded_models()
+
+
+print("== Test AK: chat timeout -> status timeout, pending kept ==")
+sess_ak, te_ak = _status_sess("fake-rt-ak")
+forget_loaded_models()
+
+class _ReadTimeout(Exception):
+    pass
+
+def _chat_ak_timeout(*a, **k):
+    raise _ReadTimeout("Read timed out waiting for token")
+
+_orig_chat_ak = oc.chat_text
+oc.chat_text = _chat_ak_timeout
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_ak._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_ak
+check(any(e is te_ak for e in sess_ak._unfused_transcripts),
+      f"Test AK: pending kept on timeout (n={len(sess_ak._unfused_transcripts)})")
+_ak_lines = _read_status_lines(sess_ak.storage.realtime_fusion_status_path)
+check(len(_ak_lines) == 1 and _ak_lines[0].get("result") == FUSE_TIMEOUT,
+      f"Test AK: result=timeout (got {_ak_lines and _ak_lines[0].get('result')})")
+check(_ak_lines and "timed out" in (_ak_lines[0].get("error_message") or "").lower(),
+      f"Test AK: timeout message (got {_ak_lines and _ak_lines[0].get('error_message')})")
+forget_loaded_models()
+
+
+print("== Test AL: fuse returns False (failure) -> status failure, pending kept ==")
+sess_al, te_al = _status_sess("fake-rt-al")
+forget_loaded_models()
+# Empty chat responses after retries: _chat_fusion returns None without raising.
+_orig_chat_al = oc.chat_text
+oc.chat_text = lambda *a, **k: ""
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_al._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_al
+check(any(e is te_al for e in sess_al._unfused_transcripts),
+      f"Test AL: pending kept when fuse=False (n={len(sess_al._unfused_transcripts)})")
+_al_lines = _read_status_lines(sess_al.storage.realtime_fusion_status_path)
+check(len(_al_lines) == 1 and _al_lines[0].get("result") == FUSE_FAILURE,
+      f"Test AL: result=failure (got {_al_lines and _al_lines[0].get('result')})")
+check("fake-rt-al" not in loaded_models(),
+      f"Test AL: no registry mark on False (got {loaded_models()})")
+forget_loaded_models()
+
+
+print("== Test AM: skip=True -> status skip, pending kept ==")
+sess_am, te_am = _status_sess("fake-rt-am")
+forget_loaded_models()
+_orig_chat_am = oc.chat_text
+oc.chat_text = lambda *a, **k: json.dumps({"skip": True, "current_topic": ""})
+try:
+    sess_am._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_am
+check(any(e is te_am for e in sess_am._unfused_transcripts),
+      f"Test AM: pending kept on skip (n={len(sess_am._unfused_transcripts)})")
+_am_lines = _read_status_lines(sess_am.storage.realtime_fusion_status_path)
+check(len(_am_lines) == 1 and _am_lines[0].get("result") == FUSE_SKIP,
+      f"Test AM: result=skip (got {_am_lines and _am_lines[0].get('result')})")
+check("fake-rt-am" not in loaded_models(),
+      f"Test AM: no registry mark on skip (got {loaded_models()})")
+forget_loaded_models()
+
+
+print("== Test AN: mid-fuse new event preserved; status success counts ==")
+sess_an = CourseSession(_Region(10, 10, 50, 50))
+sess_an.storage.ensure_live_header("t")
+sess_an.note_engine = NoteEngine(sess_an.storage, model="fake-rt-an")
+forget_loaded_models()
+te_an_a = _TE(text="HEAD_AN", session_t=1.0)
+te_an_b = _TE(text="TAIL_AN_DURING_FUSE", session_t=2.0)
+with sess_an._lock:
+    sess_an._unfused_transcripts.append(te_an_a)
+
+def _chat_an_ok(*a, **k):
+    with sess_an._lock:
+        sess_an._unfused_transcripts.append(te_an_b)
+    return _chat_delta_ok()
+
+_orig_chat_an = oc.chat_text
+oc.chat_text = _chat_an_ok
+try:
+    sess_an._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_an
+check(not any(e is te_an_a for e in sess_an._unfused_transcripts),
+      f"Test AN: snapshot consumed (n={len(sess_an._unfused_transcripts)})")
+check(any(e is te_an_b for e in sess_an._unfused_transcripts),
+      f"Test AN: mid-fuse event kept (n={len(sess_an._unfused_transcripts)})")
+_an_lines = _read_status_lines(sess_an.storage.realtime_fusion_status_path)
+check(len(_an_lines) == 1 and _an_lines[0].get("result") == FUSE_OK,
+      f"Test AN: result=success (got {_an_lines and _an_lines[0].get('result')})")
+check(_an_lines and _an_lines[0].get("pending_transcript_count") == 1
+      and _an_lines[0].get("pending_visual_count") == 0,
+      f"Test AN: status records pre-fuse counts (got {_an_lines and _an_lines[0]})")
+check(_an_lines and isinstance(_an_lines[0].get("latency_ms"), int)
+      and _an_lines[0].get("latency_ms") >= 0,
+      f"Test AN: latency_ms present (got {_an_lines and _an_lines[0].get('latency_ms')})")
+forget_loaded_models()
+
+
+print("== Test AO: realtime fusion failure never sets session FAILED ==")
+sess_ao = CourseSession(_Region(10, 10, 50, 50))
+sess_ao.storage.ensure_live_header("t")
+sess_ao.note_engine = NoteEngine(sess_ao.storage, model="fake-rt-ao")
+sess_ao.running = True
+sess_ao.state = _SSState.RUNNING
+sess_ao.audio = object()  # sentinel: not None means workers present
+sess_ao.visual = _OrderVisual()
+forget_loaded_models()
+with sess_ao._lock:
+    sess_ao._unfused_transcripts.append(_TE(text="pend_ao", session_t=1.0))
+_orig_chat_ao = oc.chat_text
+oc.chat_text = lambda *a, **k: "broken {{{"
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_ao._fuse_once()
+        sess_ao._fuse_once()  # second failure must not escalate lifecycle
+finally:
+    oc.chat_text = _orig_chat_ao
+check(sess_ao.state == _SSState.RUNNING,
+      f"Test AO: state stays RUNNING (got {sess_ao.state})")
+check(sess_ao.running is True, "Test AO: running stays True after fusion failures")
+check(len(sess_ao._unfused_transcripts) == 1,
+      f"Test AO: pending intact after two failures (n={len(sess_ao._unfused_transcripts)})")
+_ao_lines = _read_status_lines(sess_ao.storage.realtime_fusion_status_path)
+check(len(_ao_lines) == 2 and all(
+      ln.get("attempt_id") == i + 1 for i, ln in enumerate(_ao_lines)),
+      f"Test AO: two attempts, attempt_id 1..2 (got {[ln.get('attempt_id') for ln in _ao_lines]})")
+check(all(ln.get("result") in (FUSE_INVALID_JSON, FUSE_FAILURE, FUSE_EXCEPTION)
+          for ln in _ao_lines),
+      f"Test AO: both attempts failure-class (got {[ln.get('result') for ln in _ao_lines]})")
+forget_loaded_models()
+
+
+print("== Test AP: status never embeds full prompt/response bodies ==")
+_sess_p, _te_p = _status_sess("fake-rt-ap", text="SECRET_COURSE_TEXT_MARKER_123")
+forget_loaded_models()
+
+def _chat_ap_leaky(*a, **k):
+    # Large body: must NOT land in status fields (only truncated error_message
+    # for exceptions; invalid_json uses a fixed short message).
+    return "LEAK_PROMPT_AND_RESPONSE_" + ("X" * 5000)
+
+_orig_chat_ap = oc.chat_text
+oc.chat_text = _chat_ap_leaky
+try:
+    with patch("time.sleep", lambda _s: None):
+        _sess_p._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_ap
+_ap_raw = _sess_p.storage.realtime_fusion_status_path.read_text(encoding="utf-8")
+check("SECRET_COURSE_TEXT_MARKER_123" not in _ap_raw,
+      "Test AP: no transcript text in status file")
+check("LEAK_PROMPT_AND_RESPONSE_" not in _ap_raw
+      and "XXXX" not in _ap_raw,
+      "Test AP: no raw model response body in status file")
+check(len(_ap_raw) < 4000,
+      f"Test AP: status line stays small (got {len(_ap_raw)} bytes)")
+check(any(e is _te_p for e in _sess_p._unfused_transcripts),
+      "Test AP: pending kept while status written")
+forget_loaded_models()
+
+
+print("== Test AQ: fusion loop keeps running after _fuse_once exception ==")
+sess_aq = CourseSession(_Region(10, 10, 50, 50))
+sess_aq.storage.ensure_live_header("t")
+sess_aq.note_engine = NoteEngine(sess_aq.storage, model="fake-rt-aq")
+sess_aq.running = True
+sess_aq.state = _SSState.RUNNING
+with sess_aq._lock:
+    sess_aq._unfused_transcripts.append(_TE(text="pend_aq", session_t=1.0))
+
+def _fuse_raise_once(*a, **k):
+    raise RuntimeError("unexpected fuse crash")
+
+_orig_fuse_aq = sess_aq.note_engine.fuse
+sess_aq.note_engine.fuse = _fuse_raise_once
+try:
+    sess_aq._fuse_once()  # must not raise out of _fuse_once
+finally:
+    sess_aq.note_engine.fuse = _orig_fuse_aq
+check(sess_aq.state == _SSState.RUNNING,
+      f"Test AQ: state still RUNNING after fuse crash (got {sess_aq.state})")
+check(len(sess_aq._unfused_transcripts) == 1,
+      f"Test AQ: pending kept when fuse raises (n={len(sess_aq._unfused_transcripts)})")
+_aq_lines = _read_status_lines(sess_aq.storage.realtime_fusion_status_path)
+check(len(_aq_lines) == 1 and _aq_lines[0].get("result") == FUSE_EXCEPTION,
+      f"Test AQ: status result=exception (got {_aq_lines and _aq_lines[0].get('result')})")
+check(_aq_lines and _aq_lines[0].get("exception_type") == "RuntimeError",
+      f"Test AQ: exception_type RuntimeError (got {_aq_lines and _aq_lines[0].get('exception_type')})")
+# After recovery, a successful fuse still works and drains snapshot.
+sess_aq.note_engine.fuse = _orig_fuse_aq
+_orig_chat_aq = oc.chat_text
+oc.chat_text = _chat_delta_ok
+try:
+    sess_aq._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_aq
+check(len(sess_aq._unfused_transcripts) == 0,
+      f"Test AQ: recovered success drains pending (n={len(sess_aq._unfused_transcripts)})")
+_aq_lines2 = _read_status_lines(sess_aq.storage.realtime_fusion_status_path)
+check(len(_aq_lines2) == 2 and _aq_lines2[1].get("result") == FUSE_OK,
+      f"Test AQ: second attempt success recorded (got {[ln.get('result') for ln in _aq_lines2]})")
+forget_loaded_models()
+
+
+print("== Test AR: NoteEngine.last_fuse classifications (unit) ==")
+_storage_ar = _SS()
+_ne_ar = NoteEngine(_storage_ar, model="fake-rt-ar")
+forget_loaded_models()
+
+_orig_chat_ar = oc.chat_text
+# empty input -> FUSE_EMPTY, no chat call
+_r_ar = _ne_ar.fuse([], [])
+check(_r_ar is False and _ne_ar.last_fuse.get("result") == FUSE_EMPTY,
+      f"Test AR: empty input -> empty (got {_ne_ar.last_fuse})")
+
+# invalid json
+oc.chat_text = lambda *a, **k: "nope"
+try:
+    with patch("time.sleep", lambda _s: None):
+        _r_ar2 = _ne_ar.fuse([_TE(text="x", session_t=1.0)], [])
+finally:
+    pass
+check(_r_ar2 is False and _ne_ar.last_fuse.get("result") == FUSE_INVALID_JSON,
+      f"Test AR: invalid_json (got {_ne_ar.last_fuse.get('result')})")
+
+# skip
+oc.chat_text = lambda *a, **k: json.dumps({"skip": True})
+_r_ar3 = _ne_ar.fuse([_TE(text="x", session_t=1.0)], [])
+check(_r_ar3 is False and _ne_ar.last_fuse.get("result") == FUSE_SKIP,
+      f"Test AR: skip (got {_ne_ar.last_fuse.get('result')})")
+
+# success
+oc.chat_text = _chat_delta_ok
+_r_ar4 = _ne_ar.fuse([_TE(text="real", session_t=2.0)], [])
+check(_r_ar4 is True and _ne_ar.last_fuse.get("result") == FUSE_OK,
+      f"Test AR: success (got {_ne_ar.last_fuse.get('result')})")
+check(_ne_ar.last_fuse.get("input_chars", 0) > 0,
+      f"Test AR: input_chars recorded (got {_ne_ar.last_fuse.get('input_chars')})")
+
+# exception inside fuse outer path is still classified
+def _chat_ar_raise(*a, **k):
+    raise ValueError("chat path fail")
+oc.chat_text = _chat_ar_raise
+try:
+    with patch("time.sleep", lambda _s: None):
+        _ne_ar.fuse([_TE(text="y", session_t=3.0)], [])
+finally:
+    oc.chat_text = _orig_chat_ar
+check(_ne_ar.last_fuse.get("result") == FUSE_EXCEPTION
+      and _ne_ar.last_fuse.get("exception_type") == "ValueError",
+      f"Test AR: chat exception classified (got {_ne_ar.last_fuse})")
+forget_loaded_models()
+
+
+print("== Test AT: realtime failure leaves tail for Final Fusion + empty /api/ps path ==")
+TAIL_AT = "TAIL_TOPIC_AT"
+sess_at = CourseSession(_Region(10, 10, 50, 50))
+sess_at.visual = _OrderVisual()
+sess_at.audio = None
+sess_at._fusion_thread = _OrderThread()
+sess_at.running = True
+sess_at.state = _SSState.RUNNING
+sess_at.storage.ensure_live_header("t")
+sess_at.storage.append_event({"text": "head", "session_t": 0.0})
+sess_at.note_engine = NoteEngine(sess_at.storage, model="fake-rt-at")
+te_at = _TE(text=f"{TAIL_AT} core_fact", session_t=50.0)
+with sess_at._lock:
+    sess_at._unfused_transcripts.append(te_at)
+_orig_chat_at = oc.chat_text
+oc.chat_text = lambda *a, **k: "not json {{{"
+try:
+    with patch("time.sleep", lambda _s: None):
+        sess_at._fuse_once()
+finally:
+    oc.chat_text = _orig_chat_at
+check(any(e is te_at for e in sess_at._unfused_transcripts),
+      f"Test AT: tail still pending after realtime failure (n={len(sess_at._unfused_transcripts)})")
+check(sess_at.state == _SSState.RUNNING,
+      f"Test AT: session still RUNNING (got {sess_at.state})")
+_at_lines = _read_status_lines(sess_at.storage.realtime_fusion_status_path)
+check(len(_at_lines) == 1 and _at_lines[0].get("result") == FUSE_INVALID_JSON,
+      f"Test AT: status written for final-bound failure attempt")
+
+captured_at: dict = {}
+
+def _capture_final_at(storage, status=None, **kwargs):
+    captured_at["pending_transcripts"] = list(kwargs.get("pending_transcripts") or [])
+    captured_at["pending_visuals"] = list(kwargs.get("pending_visuals") or [])
+    captured_at["note_engine"] = kwargs.get("note_engine")
+    p = storage.final_summary_path
+    p.write_text("# at summary", encoding="utf-8")
+    return "success", str(p), []
+
+def _release_at(**kwargs):
+    return True, []
+
+def _can_at():
+    return True, "ok"
+
+with patch("app.course_session.final_summary.release_realtime_models", _release_at), \
+     patch("app.course_session.final_summary.can_load_final_model", _can_at), \
+     patch("app.course_session.final_summary.run_final_phase", _capture_final_at):
+    res_at = sess_at._cleanup_core(
+        stop_visual=True, stop_audio=False, stop_fusion=True,
+        release_models=True,
+        wait_final_summary=True, failed=False,
+    )
+
+texts_at = [getattr(e, "text", "") for e in (captured_at.get("pending_transcripts") or [])]
+check(any(TAIL_AT in t for t in texts_at),
+      f"Test AT: tail fed to Final Fusion pending (texts={texts_at})")
+check(captured_at.get("note_engine") is sess_at.note_engine,
+      "Test AT: cleanup drains pending into run_final_phase")
+check(sess_at.storage.final_summary_path.exists(),
+      "Test AT: final_summary written after realtime failure")
+check(res_at is not None and getattr(res_at, "success", None) is True,
+      f"Test AT: stop succeeded after realtime failures (got {res_at})")
+
+
 print()
 print("== Anti-false-pass scan ==")
 test_src = Path("test_stability.py").read_text(encoding="utf-8")

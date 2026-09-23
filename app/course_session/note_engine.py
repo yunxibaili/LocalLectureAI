@@ -35,6 +35,16 @@ FUSION_SUCCESS = "success"
 FUSION_NOOP = "no-op"
 FUSION_FAILURE = "failure"
 
+# Realtime fuse() diagnostic outcomes (Round 12): stored on NoteEngine.last_fuse.
+# Behavior of fuse() return value is unchanged (True only on applied delta).
+FUSE_OK = "success"
+FUSE_SKIP = "skip"
+FUSE_INVALID_JSON = "invalid_json"
+FUSE_TIMEOUT = "timeout"
+FUSE_EXCEPTION = "exception"
+FUSE_EMPTY = "empty"
+FUSE_FAILURE = "failure"
+
 
 def _parse_json_loose(raw: str) -> Optional[dict]:
     if not raw:
@@ -76,6 +86,18 @@ class NoteEngine:
         self.storage = storage
         self.model = model
         self.state = CourseState()
+        # Round 12: structured diagnostics for the last realtime fuse() call.
+        # Never contains full prompts or full model responses.
+        self.last_fuse: dict = {
+            "result": None,
+            "input_chars": 0,
+            "exception_type": None,
+            "error_message": None,
+            "latency_ms": 0,
+        }
+        self._chat_exc_type: str | None = None
+        self._chat_exc_msg: str | None = None
+        self._chat_timeout: bool = False
 
     # ------------------------------------------------------------------
     def fuse(
@@ -89,37 +111,86 @@ class NoteEngine:
         - skip=True / invalid JSON / exception → False, NO mark_model_loaded.
         - Applied delta → True + mark_model_loaded(self.model).
         Callers must not register the model when this returns False.
+
+        Round 12: always refreshes self.last_fuse with a structured outcome
+        (success|skip|invalid_json|timeout|exception|empty|failure). Does not
+        change the boolean contract or consume pending (caller owns pending).
         """
         from core.ollama_client import chat_text  # reuse QLens client
 
-        tr_lines = self._transcript_lines(transcripts)
-        vi_lines = self._visual_lines(visuals)
-        if not tr_lines and not vi_lines:
-            return False
+        diag: dict = {
+            "result": FUSE_FAILURE,
+            "input_chars": 0,
+            "exception_type": None,
+            "error_message": None,
+            "latency_ms": 0,
+        }
+        t0 = time.perf_counter()
+        try:
+            tr_lines = self._transcript_lines(transcripts)
+            vi_lines = self._visual_lines(visuals)
+            diag["input_chars"] = sum(len(x) for x in tr_lines) + sum(
+                len(x) for x in vi_lines
+            )
+            if not tr_lines and not vi_lines:
+                diag["result"] = FUSE_EMPTY
+                return False
 
-        raw = self._chat_fusion(
-            chat_text,
-            tr_lines,
-            vi_lines,
-            model=self.model,
-            num_ctx=NUM_CTX_LIVE,
-        )
-        if raw is None:
-            return False
+            self._chat_exc_type = None
+            self._chat_exc_msg = None
+            self._chat_timeout = False
+            raw = self._chat_fusion(
+                chat_text,
+                tr_lines,
+                vi_lines,
+                model=self.model,
+                num_ctx=NUM_CTX_LIVE,
+            )
+            if raw is None:
+                if self._chat_timeout:
+                    diag["result"] = FUSE_TIMEOUT
+                    diag["exception_type"] = self._chat_exc_type or "Timeout"
+                    diag["error_message"] = self._chat_exc_msg
+                elif self._chat_exc_type:
+                    diag["result"] = FUSE_EXCEPTION
+                    diag["exception_type"] = self._chat_exc_type
+                    diag["error_message"] = self._chat_exc_msg
+                else:
+                    diag["result"] = FUSE_FAILURE
+                    diag["error_message"] = "empty chat response"
+                return False
 
-        delta = _parse_json_loose(raw)
-        if delta is None:
-            log.warning("fusion response not JSON (ignored): %s", (raw or "")[:200])
-            return False
-        if delta.get("skip") is True:
-            # no-op: model may have loaded, but skip must NOT register as success
-            log.info("fusion skip (no valuable new info)")
-            return False
+            delta = _parse_json_loose(raw)
+            if delta is None:
+                log.warning(
+                    "fusion response not JSON (ignored): %s", (raw or "")[:200]
+                )
+                diag["result"] = FUSE_INVALID_JSON
+                diag["error_message"] = "response not JSON"
+                return False
+            if delta.get("skip") is True:
+                # no-op: model may have loaded, but skip must NOT register as success
+                log.info("fusion skip (no valuable new info)")
+                diag["result"] = FUSE_SKIP
+                return False
 
-        mark_model_loaded(self.model)
-        self._apply_delta(delta)
-        self._persist_section(tr_lines, vi_lines)
-        return True
+            mark_model_loaded(self.model)
+            self._apply_delta(delta)
+            self._persist_section(tr_lines, vi_lines)
+            diag["result"] = FUSE_OK
+            return True
+        except Exception as e:
+            # Round 12: fuse itself must not raise for ordinary chat failures;
+            # still classify so session can write realtime_fusion_status.
+            log.error("fuse raised: %s: %s", type(e).__name__, e)
+            diag["result"] = FUSE_EXCEPTION
+            diag["exception_type"] = type(e).__name__
+            diag["error_message"] = str(e)[:300]
+            return False
+        finally:
+            diag["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+            # Shallow copy so callers cannot mutate the stored snapshot by accident.
+            self.last_fuse = dict(diag)
 
     def fuse_final(
         self,
@@ -197,9 +268,16 @@ class NoteEngine:
         think: Optional[bool] = None,
         timeout: Optional[int] = None,
     ) -> Optional[str]:
-        """One fusion chat with retry. Returns raw text or None on failure."""
+        """One fusion chat with retry. Returns raw text or None on failure.
+
+        Round 12: records exception type / timeout on self._chat_* for
+        last_fuse diagnostics. Does not change return contract.
+        """
         user = build_fusion_prompt(self.state.to_dict(), tr_lines, vi_lines)
         raw = ""
+        self._chat_exc_type = None
+        self._chat_exc_msg = None
+        self._chat_timeout = False
         try:
             for attempt in range(2):
                 raw = chat_text(
@@ -213,7 +291,15 @@ class NoteEngine:
                 time.sleep(1.0)
             return raw or None
         except Exception as e:
-            log.error("fusion chat_text failed: %s: %s", type(e).__name__, e)
+            ename = type(e).__name__
+            emsg = str(e)[:300]
+            log.error("fusion chat_text failed: %s: %s", ename, e)
+            self._chat_exc_type = ename
+            self._chat_exc_msg = emsg
+            low = (ename + " " + emsg).lower()
+            self._chat_timeout = (
+                "timeout" in low or "timed out" in low or "readtimeout" in low
+            )
             return None
 
     def _persist_section(self, tr_lines: List[str], vi_lines: List[str]) -> None:

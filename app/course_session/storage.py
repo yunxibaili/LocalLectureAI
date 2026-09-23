@@ -35,6 +35,8 @@ class SessionStorage:
         self.transcript_path = self.dir / "transcript.md"          # final name
         self.final_summary_path = self.dir / "final_summary.md"
         self.partial_notes_path = self.dir / "partial_notes.md"
+        # Round 12: one line per realtime fusion attempt (always on; no prompts).
+        self.realtime_fusion_status_path = self.dir / "realtime_fusion_status.jsonl"
         self._transcript_writer_path: Path | None = None           # Hearsay-named file
         self._live_initialized = False
         self._active_marker_written = False
@@ -91,6 +93,10 @@ class SessionStorage:
 
     def append_course_state(self, obj: Any) -> None:
         self._append_jsonl(self.course_state_path, obj)
+
+    def append_realtime_fusion_status(self, obj: Any) -> None:
+        """Append one realtime-fusion diagnostic record (Round 12)."""
+        self._append_jsonl(self.realtime_fusion_status_path, obj)
 
     # ---------- live notes ----------
     def ensure_live_header(self, title: str) -> None:
