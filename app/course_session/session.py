@@ -134,6 +134,18 @@ class CourseSession:
                 t0=self._t0,
                 on_fatal=self._on_audio_fatal,
             )
+            # Round 10: point instrumentation sink BEFORE start so load/callback
+            # events land in this session dir (no-op when INSTRUMENTATION off).
+            try:
+                from .settings import INSTRUMENTATION
+
+                if INSTRUMENTATION:
+                    self.audio.set_instrumentation_path(
+                        self.storage.dir / "instrumentation.jsonl"
+                    )
+                    self._status("INSTRUMENTATION=on → instrumentation.jsonl")
+            except Exception:
+                log.error("set_instrumentation_path failed", exc_info=True)
             self._status("启动音频与 Whisper…")
             self.audio.start()
             self.storage.set_transcript_writer_path(self.audio.writer_path)

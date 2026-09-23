@@ -206,6 +206,8 @@ WHISPER_DEVICE = _env("WHISPER_DEVICE", "auto")     # auto|cuda|cpu
 WHISPER_COMPUTE = _env("WHISPER_COMPUTE", "")       # empty = by device
 WHISPER_LANGUAGE = _env("WHISPER_LANGUAGE", "zh")
 AUDIO_SOURCE = _env("AUDIO_SOURCE", "system")
+# Round 10: observe-only instrumentation (default off; no behavior change).
+INSTRUMENTATION = _env("INSTRUMENTATION", "false").strip().lower() in ("1", "true", "yes", "on")
 
 # --- Course note fusion ---
 FUSION_INTERVAL_S = float(_env("FUSION_INTERVAL_S", "45"))

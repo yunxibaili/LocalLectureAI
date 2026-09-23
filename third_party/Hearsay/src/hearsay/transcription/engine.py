@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import numpy as np
 
 from hearsay.utils.paths import get_models_dir
+
+try:
+    from hearsay.utils import instrumentation as _inst
+except Exception:  # pragma: no cover
+    class _InstFallback:
+        @staticmethod
+        def emit(*a, **k):
+            return None
+
+        @staticmethod
+        def enabled() -> bool:
+            return False
+
+    _inst = _InstFallback()
 
 log = logging.getLogger(__name__)
 
@@ -52,13 +67,28 @@ class TranscriptionEngine:
             self.device,
             self.compute_type,
         )
+        _inst.emit(
+            "engine_load_start",
+            model=self.model_name,
+            device=self.device,
+            compute_type=self.compute_type,
+        )
+        _load_t0 = time.perf_counter()
         self._model = WhisperModel(
             self.model_name,
             device=self.device,
             compute_type=self.compute_type,
             download_root=str(get_models_dir()),
         )
+        _load_ms = int((time.perf_counter() - _load_t0) * 1000)
         log.info("Model loaded successfully")
+        _inst.emit(
+            "engine_load_end",
+            model=self.model_name,
+            device=self.device,
+            compute_type=self.compute_type,
+            engine_load_duration_ms=_load_ms,
+        )
 
     def transcribe(
         self,
@@ -77,6 +107,7 @@ class TranscriptionEngine:
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        _t0 = time.perf_counter()
         segments_iter, info = self._model.transcribe(
             audio,
             beam_size=5,
@@ -96,6 +127,21 @@ class TranscriptionEngine:
             texts.append(seg.text.strip())
 
         full_text = " ".join(texts)
+        _ms = int((time.perf_counter() - _t0) * 1000)
+        _inst.emit(
+            "engine_transcribe",
+            window_id=chunk_index,
+            window_duration_s=round(float(len(audio)) / 16000.0, 4) if len(audio) else 0.0,
+            transcribe_duration_ms=_ms,
+            segment_count=len(segments),
+            text_length=len(full_text),
+            language=info.language,
+            language_probability=info.language_probability,
+            vad_filter=bool(self.vad_filter),
+            duration=getattr(info, "duration", None),
+            duration_after_vad=getattr(info, "duration_after_vad", None),
+            no_speech_prob=getattr(info, "no_speech_prob", None),
+        )
         log.debug(
             "Chunk %d: %d segments, lang=%s (%.2f), text=%s",
             chunk_index,

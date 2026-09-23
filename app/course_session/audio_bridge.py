@@ -33,6 +33,24 @@ from .events import TranscriptEvent
 
 log = logging.getLogger(__name__)
 
+try:
+    from hearsay.utils import instrumentation as _inst
+except Exception:  # pragma: no cover
+    class _InstFallback:
+        @staticmethod
+        def emit(*a, **k):
+            return None
+
+        @staticmethod
+        def enabled() -> bool:
+            return False
+
+        @staticmethod
+        def set_output(path) -> None:
+            return None
+
+    _inst = _InstFallback()
+
 
 class AudioBridge:
     def __init__(
@@ -72,10 +90,17 @@ class AudioBridge:
         self.last_status: str = "idle"
         self.chunks_transcribed = 0
         self.events_emitted = 0
+        self._instrumentation_path: Optional[Path] = None
 
     @property
     def writer_path(self) -> Path:
         return self._writer_path
+
+    def set_instrumentation_path(self, path: Path | str) -> None:
+        """Point Round 10 JSONL sink at the session dir (no-op if disabled)."""
+        self._instrumentation_path = Path(path)
+        if _inst.enabled():
+            _inst.set_output(self._instrumentation_path)
 
     def workers_alive(self) -> list[str]:
         """Names of still-running worker threads (for stop-gate checks).
@@ -104,6 +129,8 @@ class AudioBridge:
         from hearsay.transcription.pipeline import TranscriptionPipeline  # reuse
         from hearsay.transcription.gpu_detect import detect_gpu       # reuse
 
+        _inst.emit("audio_bridge_start_begin")
+        _start_t0 = time.perf_counter()
         device = WHISPER_DEVICE
         compute = WHISPER_COMPUTE
         if device == "auto":
@@ -116,6 +143,7 @@ class AudioBridge:
             compute = "float16" if device == "cuda" else "int8"
 
         self.last_status = f"loading whisper ({WHISPER_MODEL}, {device}/{compute})..."
+        _load_t0 = time.perf_counter()
         engine = TranscriptionEngine(
             model_name=WHISPER_MODEL,
             device=device,
@@ -129,6 +157,7 @@ class AudioBridge:
             # GPU load failure -> CPU fallback (documented in TEST_REPORT)
             log.warning("whisper load on %s failed (%s); falling back to cpu/int8", device, e)
             self.last_error = f"gpu whisper failed: {e}"
+            _inst.emit("engine_load_fallback", device=device, error=str(e))
             device, compute = "cpu", "int8"
             engine = TranscriptionEngine(
                 model_name=WHISPER_MODEL,
@@ -137,8 +166,17 @@ class AudioBridge:
                 language=WHISPER_LANGUAGE,
                 vad_filter=True,
             )
+            _load_t0 = time.perf_counter()
             engine.load()
 
+        _bridge_load_ms = int((time.perf_counter() - _load_t0) * 1000)
+        _inst.emit(
+            "audio_bridge_load_end",
+            model=WHISPER_MODEL,
+            device=device,
+            compute=compute,
+            engine_load_duration_ms=_bridge_load_ms,
+        )
         self._engine = engine
         pipeline = None
         recorder = None
@@ -150,6 +188,7 @@ class AudioBridge:
             )
             pipeline.start()
             self._pipeline = pipeline
+            _inst.emit("pipeline_started")
 
             recorder = AudioRecorder(
                 audio_queue=self._audio_queue,
@@ -159,6 +198,7 @@ class AudioBridge:
             )
             recorder.start()
             self._recorder = recorder
+            _inst.emit("recorder_started_from_bridge", source=AUDIO_SOURCE)
         except Exception:
             # reverse-order rollback: recorder -> pipeline -> engine
             self._rollback_start(recorder, pipeline, engine)
@@ -173,6 +213,11 @@ class AudioBridge:
         self._poll_thread.start()
         self.last_status = f"recording ({AUDIO_SOURCE}, whisper {device})"
         log.info("AudioBridge started: %s", self.last_status)
+        _inst.emit(
+            "audio_bridge_start_end",
+            status=self.last_status,
+            total_start_ms=int((time.perf_counter() - _start_t0) * 1000),
+        )
 
     def _rollback_start(self, recorder, pipeline, engine) -> None:
         """Best-effort reverse teardown of a partially started stack.
@@ -228,11 +273,19 @@ class AudioBridge:
             log.error("MarkdownWriter.append failed", exc_info=True)
 
         if not result.segments:
+            _inst.emit(
+                "result_empty_segments",
+                window_id=getattr(result, "chunk_index", None),
+                window_start_s=getattr(result, "window_start", None),
+                segment_count=0,
+                drop_reason="empty_result_no_transcript_event",
+            )
             return
 
         session_t = time.monotonic() - self._t0
         # Merge segments of this window into a couple of TranscriptEvents
         # (one per segment keeps alignment precise; windows are 30s).
+        emitted_here = 0
         for seg in result.segments:
             text = (seg.get("text") or "").strip()
             if not text:
@@ -245,15 +298,32 @@ class AudioBridge:
                 session_t=session_t + float(seg.get("start", 0)),
             )
             self.events_emitted += 1
+            emitted_here += 1
+            _inst.emit(
+                "transcript_event",
+                window_id=getattr(result, "chunk_index", None),
+                session_t=round(ev.session_t, 3),
+                text_length=len(text),
+                events_emitted_total=self.events_emitted,
+                text_preview=text[:40],
+            )
             self._on_event(ev)
 
         self.chunks_transcribed += 1
         preview = " ".join(s.get("text", "") for s in result.segments)[:80]
         self.last_status = f"chunk {result.chunk_index}: {preview}"
+        _inst.emit(
+            "result_handled",
+            window_id=getattr(result, "chunk_index", None),
+            segment_count=len(result.segments),
+            events_emitted=emitted_here,
+            chunks_transcribed=self.chunks_transcribed,
+        )
 
     def _handle_fatal(self, exc: Exception) -> None:
         self.last_error = f"recorder fatal: {exc}"
         log.error("AudioRecorder fatal: %s", exc)
+        _inst.emit("recorder_fatal", error=str(exc))
         if self._on_fatal:
             try:
                 self._on_fatal(exc)
@@ -263,6 +333,7 @@ class AudioBridge:
     def _handle_no_audio(self) -> None:
         self.last_status = "warning: no audio captured (device silent)"
         log.warning("AudioBridge: no audio captured")
+        _inst.emit("on_no_audio_bridge", status=self.last_status)
         if self._on_no_audio:
             try:
                 self._on_no_audio()

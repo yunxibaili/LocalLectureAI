@@ -1,6 +1,17 @@
-﻿# Hearsay upstream diff: EMPTY (source unmodified).
+﻿# Hearsay upstream diff record: NON-EMPTY as of Round 10.
 # Baseline: parkscloud/Hearsay @ 4d5a56d76ed67b6af9d823ef1c9691b9e5dc907c
-# Verification: git status --short was empty against that baseline after vendoring;
-# nested .git was removed so this file is a recorded statement, not a re-runnable patch.
+# Nested .git was removed after vendoring — this file is a recorded statement,
+# not a re-runnable `git diff` against the baseline.
+#
+# Local source changes (LocalLectureAI integration + Round 10 observe-only
+# instrumentation) live in the main repo working tree:
+#   third_party/Hearsay/src/hearsay/utils/instrumentation.py  (new)
+#   third_party/Hearsay/src/hearsay/audio/recorder.py         (instrumentation hooks)
+#   third_party/Hearsay/src/hearsay/transcription/engine.py   (instrumentation hooks)
+#   third_party/Hearsay/src/hearsay/transcription/pipeline.py (instrumentation hooks)
+#   third_party/Hearsay/tests/test_round10_instrumentation.py (new)
+#   third_party/Hearsay/tests/test_pipeline_writer.py         (tests; stubs)
+# Behavioral thresholds (SILENCE_RMS_FLOOR, CHUNK_DURATION_S, VAD) are unchanged.
+# Round 10 hooks are gated by INSTRUMENTATION (default off → no-op).
+# See docs/ROUND10_WHISPER_INSTRUMENTATION_REPORT.md.
 # Runtime config (language/model) lives under %APPDATA%\Hearsay\ and is not source.
-

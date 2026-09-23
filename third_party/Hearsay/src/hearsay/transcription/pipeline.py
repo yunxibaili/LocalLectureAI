@@ -13,6 +13,20 @@ from hearsay.constants import AUDIO_SOURCE_MIC, AUDIO_SOURCE_SYSTEM
 from hearsay.transcription.engine import TranscriptionEngine, TranscriptionResult
 from hearsay.utils.threading_utils import StoppableThread
 
+try:
+    from hearsay.utils import instrumentation as _inst
+except Exception:  # pragma: no cover
+    class _InstFallback:
+        @staticmethod
+        def emit(*a, **k):
+            return None
+
+        @staticmethod
+        def enabled() -> bool:
+            return False
+
+    _inst = _InstFallback()
+
 log = logging.getLogger(__name__)
 
 
@@ -71,14 +85,27 @@ class TranscriptionPipeline(StoppableThread):
         """Transcribe each source in one window and enqueue a merged result."""
         try:
             t0 = time.perf_counter()
+            _inst.emit(
+                "pipeline_window_start",
+                window_id=chunk.index,
+                window_start_s=chunk.window_start,
+                sources=list(chunk.parts.keys()),
+                durations_s={
+                    s: round(float(len(a)) / 16000.0, 4) for s, a in chunk.parts.items()
+                },
+            )
             tagged_segments: list[dict] = []
             language: str | None = None
             language_probability = 0.0
             system_words: list[str] = []
+            engine_segment_total = 0
+            empty_text_sources: list[str] = []
 
             for source, audio in chunk.parts.items():
                 result = self.engine.transcribe(audio, chunk_index=chunk.index)
+                engine_segment_total += len(result.segments or [])
                 if not result.text:
+                    empty_text_sources.append(source)
                     continue
                 if language is None:
                     language = result.language
@@ -90,6 +117,7 @@ class TranscriptionPipeline(StoppableThread):
                     result = self._deduplicate(result, prev_tail)
                 self._prev_tails[source] = original_words[-self._TAIL_WORD_COUNT:]
                 if not result.text:
+                    empty_text_sources.append(source)
                     continue
 
                 segments = [{**seg, "source": source} for seg in result.segments]
@@ -113,7 +141,29 @@ class TranscriptionPipeline(StoppableThread):
                 elapsed,
                 merged_text[:80] if merged_text else "(empty)",
             )
+            _inst.emit(
+                "transcription",
+                window_id=chunk.index,
+                window_start_s=chunk.window_start,
+                transcribe_duration_ms=int(elapsed * 1000),
+                segment_count=len(tagged_segments),
+                engine_segment_count=engine_segment_total,
+                text_length=len(merged_text),
+                language=language,
+                language_probability=language_probability,
+                empty_text_sources=empty_text_sources or None,
+                vad_filter=bool(getattr(self.engine, "vad_filter", None)),
+            )
             if not tagged_segments:
+                _inst.emit(
+                    "zero_segment_window",
+                    window_id=chunk.index,
+                    window_start_s=chunk.window_start,
+                    transcribe_duration_ms=int(elapsed * 1000),
+                    engine_segment_count=engine_segment_total,
+                    drop_reason="no_segments_after_filters",
+                    empty_text_sources=empty_text_sources or None,
+                )
                 return
 
             self.transcript_queue.put(TranscriptionResult(
@@ -124,8 +174,16 @@ class TranscriptionPipeline(StoppableThread):
                 chunk_index=chunk.index,
                 window_start=chunk.window_start,
             ))
+            _inst.emit(
+                "result_enqueued",
+                window_id=chunk.index,
+                window_start_s=chunk.window_start,
+                segment_count=len(tagged_segments),
+                text_length=len(merged_text),
+            )
         except Exception:
             log.error("Transcription failed for chunk %d", chunk.index, exc_info=True)
+            _inst.emit("pipeline_error", window_id=chunk.index, drop_reason="exception")
 
     @staticmethod
     def _normalize(word: str) -> str:

@@ -21,11 +21,14 @@ $env:FINAL_MODEL          = if ($env:FINAL_MODEL) { $env:FINAL_MODEL } else { "q
 $env:WHISPER_MODEL        = if ($env:WHISPER_MODEL) { $env:WHISPER_MODEL } else { "turbo" }
 $env:WHISPER_LANGUAGE     = "zh"
 $env:WHISPER_DEVICE      = if ($env:WHISPER_DEVICE) { $env:WHISPER_DEVICE } else { "auto" }
+# Round 10 observe-only instrumentation (default off; set true for gap analysis).
+$env:INSTRUMENTATION     = if ($env:INSTRUMENTATION) { $env:INSTRUMENTATION } else { "false" }
 
 # Print effective roles (must match docs/MODEL_LIFECYCLE_ARCHITECTURE.md)
 Write-Host "[start] VISION_MODEL=$env:VISION_MODEL"
 Write-Host "[start] REALTIME_FUSION_MODEL=$env:REALTIME_FUSION_MODEL"
 Write-Host "[start] FINAL_MODEL=$env:FINAL_MODEL"
+Write-Host "[start] INSTRUMENTATION=$env:INSTRUMENTATION"
 
 # 3) Launch course app (venv python)
 $py = Join-Path $root ".venv\Scripts\python.exe"

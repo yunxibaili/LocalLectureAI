@@ -25,6 +25,20 @@ from hearsay.constants import (
 )
 from hearsay.utils.threading_utils import StoppableThread
 
+try:  # Round 10 temporary instrumentation (no-op when INSTRUMENTATION unset)
+    from hearsay.utils import instrumentation as _inst
+except Exception:  # pragma: no cover - never break capture if helper missing
+    class _InstFallback:
+        @staticmethod
+        def emit(*a, **k):
+            return None
+
+        @staticmethod
+        def enabled() -> bool:
+            return False
+
+    _inst = _InstFallback()
+
 log = logging.getLogger(__name__)
 
 # Device-open retry policy: PortAudio -9999 "Unanticipated host error" is
@@ -75,6 +89,13 @@ class _SourceBuffer:
     def append(self, mono: np.ndarray) -> None:
         with self._lock:
             self._frames.append(mono)
+            if _inst.enabled() and not getattr(self, "_first_cb_logged", False):
+                self._first_cb_logged = True
+                _inst.emit(
+                    "first_audio_callback",
+                    source=self.source,
+                    n_samples=int(len(mono)),
+                )
 
     def cut(self) -> np.ndarray:
         """Drain buffered audio; empty when nothing arrived since the last cut."""
@@ -182,6 +203,7 @@ class AudioRecorder(StoppableThread):
 
     def run(self) -> None:
         log.info("AudioRecorder started (source=%s)", self.source)
+        _inst.emit("recorder_started", source=self.source)
         try:
             if self.source == AUDIO_SOURCE_SYSTEM:
                 self._record_loopback()
@@ -579,17 +601,31 @@ class AudioRecorder(StoppableThread):
                     self.on_no_audio()
                 except Exception:
                     log.error("on_no_audio callback failed", exc_info=True)
+                _inst.emit(
+                    "on_no_audio",
+                    silent_s=round(now - silence.last_audio, 3),
+                    source=self.source,
+                )
 
             elapsed = now - session_start
             if elapsed - window_open < CHUNK_DURATION_S:
                 continue
-            if self._emit_window(buffers, chunk_index, window_open):
+            emitted = self._emit_window(buffers, chunk_index, window_open)
+            _inst.emit(
+                "audio_window_tick",
+                window_id=chunk_index,
+                window_start_s=round(window_open, 3),
+                elapsed_s=round(elapsed, 3),
+                accepted=bool(emitted),
+            )
+            if emitted:
                 silence.note_audio(now)
             chunk_index += 1
             window_open = elapsed
 
         # Flush the final partial window so the tail of the recording isn't lost.
         self._emit_window(buffers, chunk_index, window_open)
+        _inst.emit("recorder_stopped", source=self.source)
 
     def _emit_window(
         self,
@@ -599,19 +635,70 @@ class AudioRecorder(StoppableThread):
     ) -> bool:
         """Queue one window's non-silent audio. Returns True if any was captured."""
         parts: dict[str, np.ndarray] = {}
+        per_source: list[dict] = []
         for buf in buffers:
             data = buf.cut()
+            duration_s = float(len(data)) / float(SAMPLE_RATE) if len(data) else 0.0
             if len(data) < _MIN_WINDOW_SAMPLES:
+                per_source.append({
+                    "source": buf.source,
+                    "window_duration_s": round(duration_s, 4),
+                    "n_samples": int(len(data)),
+                    "rms": None,
+                    "accepted": False,
+                    "drop_reason": "window_too_short",
+                })
                 continue
             rms = float(np.sqrt(np.mean(np.square(data, dtype=np.float64))))
             if rms < SILENCE_RMS_FLOOR:
+                per_source.append({
+                    "source": buf.source,
+                    "window_duration_s": round(duration_s, 4),
+                    "n_samples": int(len(data)),
+                    "rms": rms,
+                    "accepted": False,
+                    "drop_reason": "rms_below_threshold",
+                })
                 continue
+            per_source.append({
+                "source": buf.source,
+                "window_duration_s": round(duration_s, 4),
+                "n_samples": int(len(data)),
+                "rms": rms,
+                "accepted": True,
+                "drop_reason": None,
+            })
             parts[buf.source] = data
 
         if not parts:
+            _inst.emit(
+                "audio_window",
+                window_id=chunk_index,
+                window_start_s=round(window_start, 3),
+                duration_s=round(
+                    max((s.get("window_duration_s") or 0.0) for s in per_source), 4
+                ) if per_source else 0.0,
+                rms=max(
+                    (s.get("rms") for s in per_source if s.get("rms") is not None),
+                    default=None,
+                ),
+                accepted=False,
+                drop_reason="all_sources_filtered",
+                sources=per_source,
+            )
             return False
 
         chunk = AudioChunk(index=chunk_index, window_start=window_start, parts=parts)
+        _inst.emit(
+            "audio_window",
+            window_id=chunk_index,
+            window_start_s=round(window_start, 3),
+            duration_s=round(max((s["window_duration_s"] for s in per_source), default=0.0), 4),
+            rms=max((s.get("rms") for s in per_source if s.get("rms") is not None), default=None),
+            accepted=True,
+            drop_reason=None,
+            sources=per_source,
+        )
         log.debug(
             "Window %d queued (start=%.0fs, %s)",
             chunk_index, window_start,
@@ -620,12 +707,15 @@ class AudioRecorder(StoppableThread):
         while True:
             try:
                 self.audio_queue.put(chunk, timeout=0.5)
+                _inst.emit("window_queued", window_id=chunk_index, window_start_s=round(window_start, 3))
                 return True
             except queue.Full:
                 if self.stopped():
                     # One final non-blocking attempt so stop never hangs here.
                     try:
                         self.audio_queue.put_nowait(chunk)
+                        _inst.emit("window_queued", window_id=chunk_index, window_start_s=round(window_start, 3), forced=True)
                     except queue.Full:
                         log.warning("Audio queue full at stop; dropped window %d", chunk_index)
+                        _inst.emit("window_queue_dropped", window_id=chunk_index, drop_reason="queue_full")
                     return True
